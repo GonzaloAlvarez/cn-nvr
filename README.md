@@ -108,7 +108,7 @@ Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S
 
 ## Resiliency
 
-`resiliency.yml` → `docker-compose@cn-nvr` boot unit + 5-minute reconcile (`amun docker`). `/srv` is a local LVM volume, which amun-docker cannot gate, so `mount-precheck` asserts the volume size and the `/srv/frigate/.cn-nvr-volume` marker before `ts-nvr`/`frigate` start. `ts-nvr-watchdog` recreates netns dependents after ~30 s of drift. Verify: `~/dev/amun-docker/verify --host cerberus.lan`; `sudo systemctl restart docker-compose@cn-nvr`; `docker restart cn-nvr-ts-nvr-1` → dependents recreated.
+`resiliency.yml` → `docker-compose@cn-nvr` boot unit + 5-minute reconcile (`amun docker`). `/srv` is a local LVM volume, which amun-docker cannot gate, so `mount-precheck` asserts the volume size and the `/srv/frigate/.cn-nvr-volume` marker before `ts-nvr`/`frigate` start. `ts-nvr-watchdog` recreates netns dependents after ~30 s of drift when the sidecar container is **recreated** (new container id). A plain `docker restart cn-nvr-ts-nvr-1` keeps the id, so the watchdog sees no drift while the dependents sit in the dead namespace (Frigate unreachable, Consul deregisters after 2 min); the 5-minute amun-docker reconcile detects that case by namespace and force-recreates them — verified 2026-10-03. To restart the sidecar deliberately, recreate it instead: `docker compose up -d --force-recreate ts-nvr`. Verify: `~/dev/amun-docker/verify --host cerberus.lan`; `sudo systemctl restart docker-compose@cn-nvr`; `docker restart cn-nvr-ts-nvr-1` → dependents recreated.
 
 ## Troubleshooting
 
