@@ -15,8 +15,8 @@ mqtt:
   # Mosquitto shares the ts-nvr network namespace.
   host: 127.0.0.1
   port: 1883
-  user: "{FRIGATE_MQTT_USER}"
-  password: "{FRIGATE_MQTT_PASSWORD}"
+  user: '{FRIGATE_MQTT_USER}'
+  password: '{FRIGATE_MQTT_PASSWORD}'
   topic_prefix: frigate
   client_id: frigate
 
@@ -37,7 +37,7 @@ proxy:
       viewer:
         - cameras
   # Authentik joins group names with a pipe.
-  separator: "|"
+  separator: '|'
   default_role: viewer
   # Authentik forward_single sign-out endpoint on the protected host itself,
   # so it works on both origins (nvr.cerberus.lan and nvr.lab.gn.al).
@@ -68,13 +68,13 @@ ffmpeg:
 go2rtc:
   streams:
     driveway:
-      - "rtsp://{FRIGATE_AXIS_USER}:{FRIGATE_AXIS_PASSWORD}@10.1.1.123:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15"
+      - rtsp://{FRIGATE_AXIS_USER}:{FRIGATE_AXIS_PASSWORD}@10.1.1.123:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15
     driveway_sub:
-      - "rtsp://{FRIGATE_AXIS_USER}:{FRIGATE_AXIS_PASSWORD}@10.1.1.123:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5"
+      - rtsp://{FRIGATE_AXIS_USER}:{FRIGATE_AXIS_PASSWORD}@10.1.1.123:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5
     ptz:
-      - "rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15"
+      - rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15
     ptz_sub:
-      - "rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5"
+      - rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5
 
 objects:
   track:
@@ -128,7 +128,7 @@ birdseye:
 # email = VAPID contact, rendered from ADMIN_EMAIL by setup.sh (kept out of git).
 notifications:
   enabled: true
-  email: "${NVR_ADMIN_EMAIL}"
+  email: ${NVR_ADMIN_EMAIL}
 
 # License plate recognition on CPU (AVX2). The known plate is rendered from
 # .env by setup.sh; the template keeps the token so the public repo never
@@ -138,7 +138,7 @@ lpr:
   device: CPU
   known_plates:
     gonzalo_car:
-      - "${NVR_PLATE_GONZALO}"
+      - ${NVR_PLATE_GONZALO}
 
 semantic_search:
   enabled: false
@@ -193,7 +193,8 @@ cameras:
     onvif:
       host: 10.1.1.151
       port: 80
-      user: "{FRIGATE_AXISPTZ_USER}"
-      password: "{FRIGATE_AXISPTZ_PASSWORD}"
+      user: '{FRIGATE_AXISPTZ_USER}'
+      password: '{FRIGATE_AXISPTZ_PASSWORD}'
       autotracking:
         enabled: false
+version: 0.18-0
