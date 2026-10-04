@@ -1,0 +1,11 @@
+# secrets and rendered/runtime state — never committed
+.env
+certs/
+traefik-lan/dynamic.yml
+promtail/promtail.yml
+mosquitto/passwd
+# Frigate state: everything under config/ except the tracked template
+config/*
+!config/config.yml.tmpl
+*.bak
+.DS_Store

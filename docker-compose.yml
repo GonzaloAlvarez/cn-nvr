@@ -1,0 +1,483 @@
+# cn-nvr — Frigate NVR on cerberus.lan.
+#
+# Shape: dedicated-host stack (cn-vaultwarden) in the cn-fitness form.
+#   * ts-nvr owns a Tailscale netns (node `nvr`, tag:svc). frigate, mosquitto,
+#     node-exporter, promtail and consul-register share it, so they talk to
+#     each other on localhost and the VPS reaches them at nvr.ts.gn.al.
+#   * ts-nvr publishes ONLY on 127.0.0.1 (odd host ports so the host-network
+#     traefik-lan can own the real ports). Everything LAN-facing goes through
+#     traefik-lan: nvr.cerberus.lan + grafana.cerberus.lan on 443 (step-ca),
+#     and three HA-only entrypoints bound to ${CERBERUS_IP} for the Frigate
+#     API (5000), MQTT (1883) and the go2rtc RTSP restream (8554), each
+#     restricted to ${HA_IP} by Traefik (ClientIP / ipAllowList) AND by UFW
+#     (scripts/host-firewall.sh). Docker-published ports bypass UFW, which is
+#     why nothing here publishes on the LAN address directly.
+#   * prometheus + grafana (host-local observability plane, grafana.cerberus.lan)
+#     live on the project bridge: Grafana must resolve auth.neptune.lan through
+#     host DNS, which the MagicDNS-owned netns cannot do. Prometheus scrapes the
+#     netns through ts-nvr's pinned bridge address (172.30.5.10).
+#   * backup (offen) is on the bridge too (raidnas.lan must resolve).
+#   * mount-precheck gates the stack on the real /srv LVM volume. amun-docker's
+#     resiliency.yml can only gate NFS mounts, so this is the only /srv gate;
+#     inside a container a bind mount is always a mountpoint, hence the
+#     size + marker assertions instead of `mountpoint -q`.
+services:
+  # ── /srv gate: the recordings volume must be the 1.8T ext-data LVM, not the
+  # root filesystem showing through an unmounted /srv.
+  mount-precheck:
+    image: alpine:3.20
+    volumes:
+      - /srv:/srv-check:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        kb=$$(df -Pk /srv-check | awk 'NR==2{print $$2}')
+        [ "$$kb" -gt 1500000000 ] || { echo "FAIL: /srv is $$kb KiB - that is the root filesystem, not the ext-data LVM volume"; exit 1; }
+        [ -f /srv-check/frigate/.cn-nvr-volume ] || { echo "FAIL: /srv/frigate/.cn-nvr-volume marker missing - run ./setup.sh on the real volume"; exit 1; }
+        [ -d /srv-check/frigate/media/recordings ] || { echo "FAIL: /srv/frigate/media/recordings missing"; exit 1; }
+        echo "/srv OK: $$(df -Ph /srv-check | awk 'NR==2{print $$4}') free"
+    restart: "no"
+
+  # ── Tailscale sidecar: owns the netns shared by frigate + mosquitto + observability ──
+  ts-nvr:
+    image: tailscale/tailscale:latest
+    hostname: ts-nvr
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ts_state:/var/lib/tailscale
+      - ./certs/root_ca.crt:/staging-certs/root_ca.crt:ro
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${NVR_AUTHKEY}
+      - TS_HOSTNAME=nvr
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+      - SSL_CERT_DIR=/staging-certs
+    networks:
+      default:
+        # Pinned: the local Prometheus scrapes frigate (:5000) and
+        # node-exporter (:9100) through this address. Dynamic allocation is
+        # confined to 172.30.5.128/25 (see networks:) so the pin cannot collide.
+        ipv4_address: 172.30.5.10
+    ports:
+      # Loopback only. Host port != container port on purpose: traefik-lan
+      # (network_mode: host) owns 80/443 and the LAN-address 5000/1883/8554.
+      - "127.0.0.1:18971:8971"   # Frigate authenticated UI/API -> traefik-lan nvr-lan / nvr-health
+      - "127.0.0.1:15000:5000"   # Frigate internal API (anonymous = admin) -> traefik-lan frigate-api (HA) + break-glass
+      - "127.0.0.1:11883:1883"   # Mosquitto -> traefik-lan mqtt (HA)
+      - "127.0.0.1:18554:8554"   # go2rtc RTSP restream -> traefik-lan rtsp (HA camera entities)
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale ip --4 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      mount-precheck:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── Mosquitto: the MQTT broker Frigate and Home Assistant share. Lives in
+  # the netns so Frigate reaches it on 127.0.0.1:1883; HA reaches it through
+  # traefik-lan's `mqtt` entrypoint on ${CERBERUS_IP}:1883 (HA-only).
+  # Users (frigate, homeassistant) and passwords come from .env via setup.sh,
+  # which renders mosquitto/passwd (gitignored).
+  mosquitto:
+    image: eclipse-mosquitto:2
+    network_mode: "service:ts-nvr"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - mosquitto_data:/mosquitto/data
+    depends_on:
+      ts-nvr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frigate ──
+  # PINNED to 0.18.0, deliberately NOT tracked by Watchtower (label below):
+  # Frigate migrates its SQLite schema on boot and 0.x minors rename config
+  # keys (0.17 reshaped record retention, 0.16 proxy roles). Upgrade recipe
+  # (README "Upgrading"): read the release notes, back up ./config, bump this
+  # tag, `docker compose up -d frigate`, re-check config.yml.tmpl.
+  # UNPIN condition: none — this stays an explicit tag by design.
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:0.18.0
+    network_mode: "service:ts-nvr"
+    # (w*h*1.5*20 + 270480)/1048576 MB per camera + 40 MB logs: two 1280x720
+    # detect streams need ~100 MB; 512 MB leaves room for a third camera.
+    shm_size: 512mb
+    stop_grace_period: 30s
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128   # Intel HD 530: VAAPI decode (iHD) + OpenVINO GPU detector
+    volumes:
+      # Directory bind (not a single-file mount): Frigate's UI "Save" rewrites
+      # /config/config.yml in place and the file must survive git pulls.
+      # config/config.yml is RENDERED from config/config.yml.tmpl by setup.sh
+      # (plate number substituted); it is gitignored. scripts/config-pull.sh
+      # lifts UI edits back into the template.
+      - ./config:/config
+      - /srv/frigate/media:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=${TIMEZONE}
+      - LIBVA_DRIVER_NAME=iHD
+      # {FRIGATE_*} placeholders in config.yml are substituted by Frigate from these.
+      - FRIGATE_MQTT_USER=frigate
+      - FRIGATE_MQTT_PASSWORD=${FRIGATE_MQTT_PASSWORD}
+      - FRIGATE_AXIS_USER=${FRIGATE_AXIS_USER}
+      - FRIGATE_AXIS_PASSWORD=${FRIGATE_AXIS_PASSWORD}
+      - FRIGATE_AXISPTZ_USER=${FRIGATE_AXISPTZ_USER}
+      - FRIGATE_AXISPTZ_PASSWORD=${FRIGATE_AXISPTZ_PASSWORD}
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      # offen v2 hook (archive-pre + /bin/sh -c, see cn-mzfxa): take a
+      # consistent SQLite online-backup snapshot of frigate.db (WAL mode — a
+      # raw copy of the live file can be torn). The backup container excludes
+      # the live db and ships the snapshot.
+      docker-volume-backup.exec-label: cn-nvr
+      docker-volume-backup.archive-pre: >-
+        /bin/sh -c 'python3 -c "import sqlite3; s=sqlite3.connect(\"/config/frigate.db\"); d=sqlite3.connect(\"/config/frigate.db.snapshot\"); s.backup(d); d.close(); s.close()"'
+    depends_on:
+      ts-nvr:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+      mount-precheck:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── Consul self-registration: makes nvr.lab.gn.al routable via traefik-lab ──
+  # Two Consul services on the same address/port: `nvr` carries the Authentik
+  # forward-auth gate (authentik-lab@file lives in cn-root-docker's dynamic
+  # dir); `nvr-health` is an ungated, longer (= higher priority) rule for
+  # /api/version only, so blackbox/glance can probe Frigate itself instead
+  # of the 302 to Authentik.
+  consul-register:
+    image: curlimages/curl:8.8.0
+    network_mode: "service:ts-nvr"
+    environment:
+      - CONSUL_ADDR=http://${INFRA_VPS_TAILNET_IP}:8500
+      - TAILNET_HOST=nvr.${TAILNET_DOMAIN}
+      - LAB_DOMAIN=${LAB_DOMAIN}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        register() {
+          # register NAME PORT RULE [MIDDLEWARE]
+          NAME=$$1; PORT=$$2; RULE=$$3; MW=$${4:-}
+          MWLINE=""
+          [ -n "$$MW" ] && MWLINE=",
+            \"traefik.http.routers.$$NAME.middlewares=$$MW\""
+          PAYLOAD=$$(cat <<JSON
+        {
+          "Name": "$$NAME",
+          "ID": "$$NAME-nvr",
+          "Address": "$$TAILNET_HOST",
+          "Port": $$PORT,
+          "Tags": [
+            "traefik.enable=true",
+            "traefik.http.routers.$$NAME.rule=$$RULE",
+            "traefik.http.routers.$$NAME.entrypoints=websecure",
+            "traefik.http.routers.$$NAME.tls=true",
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"$$MWLINE
+          ],
+          "Check": {
+            "TCP": "$$TAILNET_HOST:$$PORT",
+            "Interval": "10s",
+            "DeregisterCriticalServiceAfter": "2m"
+          }
+        }
+        JSON
+          )
+          curl -sf -X PUT "$$CONSUL_ADDR/v1/agent/service/register" \
+               -H "Content-Type: application/json" -d "$$PAYLOAD" >/dev/null \
+            && echo "registered $$NAME ($$RULE -> :$$PORT)" \
+            || echo "FAILED to register $$NAME" >&2
+        }
+        while true; do
+          register nvr        8971 "Host(\`nvr.$$LAB_DOMAIN\`)" authentik-lab@file
+          register nvr-health 8971 "Host(\`nvr.$$LAB_DOMAIN\`) && Path(\`/api/version\`)"
+          sleep 60
+        done
+    depends_on:
+      ts-nvr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── promtail: ship container + journal logs to VPS Loki ──
+  promtail:
+    image: grafana/promtail:3.4.2
+    network_mode: "service:ts-nvr"
+    command: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - /run/systemd/journal:/run/systemd/journal:ro
+      - promtail_positions:/tmp
+    environment:
+      - INFRA_VPS_TAILNET_IP=${INFRA_VPS_TAILNET_IP}
+    depends_on:
+      ts-nvr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── node-exporter: host metrics for both planes (VPS via nvr.ts.gn.al:9100,
+  # local Prometheus via 172.30.5.10:9100). Also exposes amun-docker's
+  # resilience_* textfile metrics — this is the only exporter on cerberus.
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: "service:ts-nvr"
+    pid: host
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
+    depends_on:
+      ts-nvr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Host-local observability plane: Prometheus + Grafana (grafana.cerberus.lan).
+  # No alerting here — the VPS plane (cn-root-docker) owns alerts for cn-nvr.
+  # Same Prometheus pin as kaiser's cn-observability; bump them together.
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    depends_on:
+      ts-nvr:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Grafana: same image + Authentik generic-OAuth block as kaiser's
+  # cn-observability (one shared Authentik provider `grafana`, this is its
+  # third redirect URI; the client pair in .env must match the provider
+  # record — a drifted pair shows up as "Client ID Error" on login).
+  # PINNED like kaiser (dashboard JSON is schemaVersion 39); unpin/bump
+  # together with cn-observability. On the bridge so auth.neptune.lan
+  # resolves via host DNS; trusts step-ca for the OIDC backchannel.
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "127.0.0.1:13000:3000"
+    environment:
+      - GF_SERVER_ROOT_URL=https://${GRAFANA_LAN_HOST}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
+      - GF_AUTH_GENERIC_OAUTH_NAME=Authentik
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_ID=${AUTHENTIK_GRAFANA_CLIENT_ID}
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET=${AUTHENTIK_GRAFANA_CLIENT_SECRET}
+      - GF_AUTH_GENERIC_OAUTH_SCOPES=openid profile email groups
+      - GF_AUTH_GENERIC_OAUTH_USE_PKCE=true
+      - GF_AUTH_GENERIC_OAUTH_AUTH_URL=https://auth.neptune.lan/application/o/authorize/
+      - GF_AUTH_GENERIC_OAUTH_TOKEN_URL=https://auth.neptune.lan/application/o/token/
+      - GF_AUTH_GENERIC_OAUTH_API_URL=https://auth.neptune.lan/application/o/userinfo/
+      - GF_AUTH_GENERIC_OAUTH_SIGNOUT_REDIRECT_URL=https://auth.neptune.lan/application/o/grafana/end-session/
+      - GF_AUTH_GENERIC_OAUTH_ALLOWED_GROUPS=observability
+      - GF_AUTH_GENERIC_OAUTH_GROUPS_ATTRIBUTE_PATH=groups
+      - GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH=contains(groups[*], 'observability') && 'Admin' || 'Viewer'
+      - GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT=false
+      - GF_AUTH_GENERIC_OAUTH_TLS_CLIENT_CA=/etc/grafana/step-ca.crt
+      - GF_AUTH_OAUTH_ALLOW_INSECURE_EMAIL_LOOKUP=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./certs/root_ca.crt:/etc/grafana/step-ca.crt:ro
+      - grafana_data:/var/lib/grafana
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ── LAN edge for this host (network_mode: host; owns 80/443 and the HA-only
+  # entrypoints). step-ca ACME HTTP-01: pki validates through pfSense Unbound,
+  # so every name here needs a pfSense Host Override (cn-home LAN_HOSTS) as
+  # well as the Technitium record, and UFW must allow 80 from pki.
+  traefik-lan:
+    image: traefik:v3.6.9
+    network_mode: host
+    command:
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # HA-only planes, bound to the LAN address so the sidecar keeps its
+      # loopback-only publishes. Routers in dynamic.yml restrict them to HA_IP.
+      - "--entrypoints.frigate-api.address=${CERBERUS_IP}:5000"
+      - "--entrypoints.mqtt.address=${CERBERUS_IP}:1883"
+      - "--entrypoints.rtsp.address=${CERBERUS_IP}:8554"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--certificatesresolvers.stepca.acme.caserver=https://${PKI_IP}:9000/acme/acme/directory"
+      - "--certificatesresolvers.stepca.acme.email=${ADMIN_EMAIL}"
+      - "--certificatesresolvers.stepca.acme.storage=/acme/acme.json"
+      - "--certificatesresolvers.stepca.acme.httpchallenge.entrypoint=web"
+      - "--log.level=INFO"
+    environment:
+      - LEGO_CA_CERTIFICATES=/certs/root_ca.crt
+    volumes:
+      - ./traefik-lan/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - traefik_lan_acme:/acme
+      - ./certs/root_ca.crt:/certs/root_ca.crt:ro
+    # Host-network Traefik ships an empty resolv.conf on this Docker version
+    # (cn-vaultwarden, 2026-06-23): pin every name it must dial.
+    extra_hosts:
+      - "pki.lan:10.0.0.250"
+      - "auth.neptune.lan:10.1.1.92"
+    restart: unless-stopped
+
+  # ── offen: weekly off-site archive of ./config (config.yml + the SQLite
+  # snapshot taken by frigate's archive-pre hook; model_cache and the live
+  # WAL db excluded) to S3 cloudnet-lab-storage/nvr/ + raidnas WebDAV /nvr/.
+  # Recordings (/srv/frigate/media) are deliberately NOT backed up: they are
+  # retention-bound and up to ~1.5 TB. prometheus_data/grafana_data are
+  # rebuilt from provisioning. On the bridge: raidnas.lan must resolve.
+  backup:
+    image: offen/docker-volume-backup:v2.43.4
+    environment:
+      - BACKUP_CRON_EXPRESSION=0 3 * * 0
+      - BACKUP_FILENAME=nvr-%Y-%m-%dT%H-%M-%S.tar.gz
+      - BACKUP_RETENTION_DAYS=56
+      - BACKUP_EXCLUDE_REGEXP=(/model_cache/|/frigate\.db(-wal|-shm)?$$)
+      - EXEC_LABEL=cn-nvr
+      - EXEC_FORWARD_OUTPUT=true
+      - AWS_S3_BUCKET_NAME=${BACKUP_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${BACKUP_AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${BACKUP_AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_REGION=${BACKUP_AWS_REGION}
+      - AWS_S3_PATH=nvr/
+      - WEBDAV_URL=${BACKUP_WEBDAV_URL}
+      - WEBDAV_PATH=/nvr/
+      - WEBDAV_USERNAME=${BACKUP_WEBDAV_USER}
+      - WEBDAV_PASSWORD=${BACKUP_WEBDAV_PASSWORD}
+      - NOTIFICATION_URLS=smtp://${SMTP_USERNAME}:${SMTP_PASSWORD}@${SMTP_HOST}:${SMTP_PORT}/?from=${SMTP_FROM}&to=${ALERT_EMAIL}&starttls=yes
+      - NOTIFICATION_LEVEL=info
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./config:/backup/config:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  # ── Watchtower: the ONE instance for cerberus (host-wide; a second one on the
+  # same socket collides). Pinned images opt out with the label above.
+  watchtower:
+    image: containrrr/watchtower:latest
+    command:
+      - "--cleanup"
+      - "--schedule=0 0 4 * * *"
+      - "--notification-url=smtp://${SMTP_USERNAME}:${SMTP_PASSWORD}@${SMTP_HOST}:${SMTP_PORT}/?from=${SMTP_FROM}&to=${ALERT_EMAIL}&starttls=yes"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.45
+    restart: unless-stopped
+
+  # ── ts-nvr watchdog: force-recreate dependents on netns drift (cn-fitness copy) ──
+  # Compares each dependent's HostConfig.NetworkMode ("container:<id>") with
+  # ts-nvr's live id; after 3 polls (~30 s) of persistent drift it recreates
+  # them, and starts dependents stuck in a non-running state.
+  ts-nvr-watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        until apk add --no-cache docker-cli-compose >/dev/null 2>&1; do echo "[watchdog] waiting for network to install docker-cli-compose"; sleep 5; done
+        DEPS="frigate mosquitto consul-register promtail node-exporter"
+        ACTION_THRESHOLD=3
+        ACTION_COUNT=0
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS), drift threshold $$ACTION_THRESHOLD polls"
+        while true; do
+          TS_ID=$$(docker inspect cn-nvr-ts-nvr-1 --format "{{.Id}}" 2>/dev/null || true)
+          if [ -n "$$TS_ID" ]; then
+            NEED_RECREATE=""
+            NEED_START=""
+            for dep in $$DEPS; do
+              INFO=$$(docker inspect cn-nvr-$$dep-1 --format "{{.HostConfig.NetworkMode}} {{.State.Status}}" 2>/dev/null || true)
+              [ -n "$$INFO" ] || continue
+              DEP_NM=$$(echo "$$INFO" | awk "{print \$$1}")
+              DEP_STATUS=$$(echo "$$INFO" | awk "{print \$$2}")
+              DEP_TARGET=$${DEP_NM#container:}
+              if [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                NEED_RECREATE="$$NEED_RECREATE $$dep"
+              elif [ "$$DEP_STATUS" != "running" ]; then
+                NEED_START="$$NEED_START $$dep"
+              fi
+            done
+            if [ -n "$$NEED_RECREATE" ] || [ -n "$$NEED_START" ]; then
+              ACTION_COUNT=$$((ACTION_COUNT + 1))
+              if [ "$$ACTION_COUNT" -ge "$$ACTION_THRESHOLD" ]; then
+                if [ -n "$$NEED_RECREATE" ]; then
+                  echo "[watchdog] persistent drift on:$$NEED_RECREATE -- recreating"
+                  docker compose -p cn-nvr up -d --force-recreate --no-deps $$NEED_RECREATE \
+                    && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+                fi
+                if [ -n "$$NEED_START" ]; then
+                  echo "[watchdog] persistent stopped on:$$NEED_START -- starting"
+                  docker compose -p cn-nvr start $$NEED_START \
+                    && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+                fi
+                ACTION_COUNT=0
+              else
+                echo "[watchdog] action pending (drift:$$NEED_RECREATE start:$$NEED_START count=$$ACTION_COUNT/$$ACTION_THRESHOLD)"
+              fi
+            else
+              ACTION_COUNT=0
+            fi
+          fi
+          sleep 10
+        done
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        # 172.30.5.0/24 — next in the fleet sequence after cn-exercises (.4).
+        # ip_range keeps dynamic allocation away from the ts-nvr pin (.10).
+        - subnet: 172.30.5.0/24
+          ip_range: 172.30.5.128/25
+
+volumes:
+  ts_state:
+  mosquitto_data:
+  traefik_lan_acme:
+  prometheus_data:
+  grafana_data:
+  promtail_positions:

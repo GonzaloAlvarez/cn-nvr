@@ -1,0 +1,118 @@
+# cn-nvr traefik-lan dynamic config — rendered by setup.sh with envsubst
+# (${NVR_LAN_HOST}, ${GRAFANA_LAN_HOST}, ${HA_IP}). Single-file bind mount:
+# after a git pull run `docker compose up -d --force-recreate --no-deps traefik-lan`.
+http:
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+    # Authentik forward-auth against the EMBEDDED outpost (LAN side), copied
+    # from cn-home/traefik-lan/dynamic.yml.tmpl. Traefik strips and re-sets
+    # every authResponseHeaders entry, so a LAN client cannot inject
+    # X-authentik-* towards Frigate. The provider for this host is `nvr-lan`
+    # (cn-authentik/setup-nvr-proxy-sso.sh).
+    authentik-lan:
+      forwardAuth:
+        address: https://auth.neptune.lan/outpost.goauthentik.io/auth/traefik
+        trustForwardHeader: true
+        authResponseHeaders:
+          - X-authentik-username
+          - X-authentik-groups
+          - X-authentik-email
+          - X-authentik-name
+          - X-authentik-uid
+          - Authorization
+        tls:
+          ca: /certs/root_ca.crt
+
+  routers:
+    # Catch-all: any HTTP request hitting :80 is bumped to :443 (ACME HTTP-01
+    # is answered by Traefik before routers, so this does not break step-ca).
+    http-catchall:
+      rule: "HostRegexp(`.+`)"
+      entryPoints: [web]
+      middlewares: [https-redirect]
+      service: noop@internal
+      priority: 1
+
+    # Frigate UI/API (authenticated port 8971) behind the Authentik gate.
+    nvr-lan:
+      rule: "Host(`${NVR_LAN_HOST}`)"
+      entryPoints: [websecure]
+      middlewares: [authentik-lan]
+      service: frigate-ui
+      tls:
+        certResolver: stepca
+
+    # Ungated health probe: the longer rule outranks nvr-lan, so only
+    # /api/version (a version string, viewer role under proxy.default_role)
+    # bypasses Authentik. Used by kaiser's blackbox-https and dynacat.
+    nvr-health:
+      rule: "Host(`${NVR_LAN_HOST}`) && Path(`/api/version`)"
+      entryPoints: [websecure]
+      service: frigate-ui
+      tls:
+        certResolver: stepca
+
+    # Host-local Grafana. No forward-auth middleware: Grafana runs its own
+    # Authentik OIDC login (shared provider `grafana`, allowed group
+    # `observability`), like grafana.kaiser.lan.
+    grafana-lan:
+      rule: "Host(`${GRAFANA_LAN_HOST}`)"
+      entryPoints: [websecure]
+      service: grafana
+      tls:
+        certResolver: stepca
+
+    # Home Assistant's Frigate integration talks to the INTERNAL,
+    # unauthenticated port (anonymous = admin). Plain HTTP on ${CERBERUS_IP}:5000,
+    # accepted only from the HA host (UFW enforces the same source).
+    frigate-api-ha:
+      rule: "ClientIP(`${HA_IP}/32`)"
+      entryPoints: [frigate-api]
+      service: frigate-internal
+
+  services:
+    frigate-ui:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:18971"
+    frigate-internal:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:15000"
+    grafana:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:13000"
+
+tcp:
+  middlewares:
+    ha-only:
+      ipAllowList:
+        sourceRange:
+          - "${HA_IP}/32"
+  routers:
+    # MQTT for Home Assistant (Mosquitto has its own user/password auth too).
+    mqtt-ha:
+      rule: "HostSNI(`*`)"
+      entryPoints: [mqtt]
+      middlewares: [ha-only]
+      service: mosquitto
+    # go2rtc RTSP restream: HA's Frigate camera entities pull
+    # rtsp://${CERBERUS_IP}:8554/<camera> (RTSP over TCP).
+    rtsp-ha:
+      rule: "HostSNI(`*`)"
+      entryPoints: [rtsp]
+      middlewares: [ha-only]
+      service: go2rtc-rtsp
+  services:
+    mosquitto:
+      loadBalancer:
+        servers:
+          - address: "127.0.0.1:11883"
+    go2rtc-rtsp:
+      loadBalancer:
+        servers:
+          - address: "127.0.0.1:18554"

@@ -1,0 +1,138 @@
+# cn-nvr — Home Assistant package: Frigate known-plate arrival -> garage.
+# Deployed by homeassistant/deploy-ha.sh into
+# /usr/share/hassio/homeassistant/packages/ (loaded via `homeassistant:
+# packages: !include_dir_named packages`). __NOTIFY_SERVICE__ is replaced at
+# deploy time (default notify.mobile_app_iphone18gon).
+#
+# Shadow mode by default: the arrival automation notifies and records every
+# recognised plate, but only operates the door when
+# input_boolean.nvr_garage_auto_open_armed is on. The opener script locks the
+# wireless remotes first (ratgdo "Lock remotes"), so a visor-remote press
+# during the automated open cannot stop the door halfway; a safety reset
+# unlocks the remotes if anything leaves them locked.
+#
+# Signals from Frigate (MQTT frigate/tracked_object_update, type=lpr):
+#   name   known-plate label from lpr.known_plates (null for unknown plates)
+#   score  OCR confidence 0..1, camera, plate, timestamp
+# Later second factors (see README): zone occupancy
+# (binary_sensor.<camera>_<zone>_car_occupancy once zones exist) and a Frigate
+# vehicle-identity classifier.
+
+input_boolean:
+  nvr_garage_auto_open_armed:
+    name: "NVR: auto-open garage on known plate"
+    icon: mdi:garage-open
+
+input_number:
+  nvr_lpr_min_score:
+    name: "NVR: LPR minimum score"
+    icon: mdi:car-search
+    min: 0.5
+    max: 1.0
+    step: 0.01
+    # tuning knob; deliberately resets to the designed default on restart
+    initial: 0.95
+
+input_text:
+  nvr_last_plate_event:
+    name: "NVR: last known-plate event"
+    icon: mdi:license
+    max: 255
+
+script:
+  nvr_garage_safe_open:
+    alias: "NVR: safe garage open (lock remotes -> open -> unlock)"
+    icon: mdi:garage-open-variant
+    mode: single
+    sequence:
+      - action: lock.lock
+        target:
+          entity_id: lock.ratgdo32_9a2c58_lock_remotes
+      # Do not move the door until the opener confirms the remotes are
+      # locked; a silent ratgdo means we abort instead of racing a remote.
+      - wait_template: "{{ is_state('lock.ratgdo32_9a2c58_lock_remotes', 'locked') }}"
+        timeout: "00:00:02"
+        continue_on_timeout: false
+      - action: cover.open_cover
+        target:
+          entity_id: cover.ratgdo32_9a2c58_door
+      - wait_template: "{{ is_state('cover.ratgdo32_9a2c58_door', 'open') }}"
+        timeout: "00:00:30"
+        continue_on_timeout: true
+      - action: lock.unlock
+        target:
+          entity_id: lock.ratgdo32_9a2c58_lock_remotes
+
+automation:
+  - id: nvr_remote_lock_safety_reset
+    alias: "NVR: remote-lock safety reset"
+    description: "Never leave the wireless remotes locked for more than a minute."
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: lock.ratgdo32_9a2c58_lock_remotes
+        to: "locked"
+        for: "00:01:00"
+    actions:
+      - action: lock.unlock
+        target:
+          entity_id: lock.ratgdo32_9a2c58_lock_remotes
+
+  - id: nvr_known_plate_arrival
+    alias: "NVR: known plate arrival"
+    description: "Frigate recognised a known plate on a driveway camera: notify; open the garage only when armed."
+    mode: single
+    max_exceeded: silent
+    variables:
+      known_name: gonzalo_car
+      allowed_cameras:
+        - driveway
+        - ptz
+    triggers:
+      - trigger: mqtt
+        topic: frigate/tracked_object_update
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.payload_json is defined
+             and trigger.payload_json.type == 'lpr'
+             and trigger.payload_json.name == known_name
+             and (trigger.payload_json.score | float(0)) >= (states('input_number.nvr_lpr_min_score') | float(0.95))
+             and trigger.payload_json.camera in allowed_cameras }}
+    actions:
+      - variables:
+          armed: "{{ is_state('input_boolean.nvr_garage_auto_open_armed', 'on') }}"
+          summary: >-
+            {{ now().strftime('%Y-%m-%d %H:%M') }} {{ trigger.payload_json.plate }}
+            {{ ((trigger.payload_json.score | float(0)) * 100) | round(0) }}% @{{ trigger.payload_json.camera }}
+            armed={{ armed }}
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.nvr_last_plate_event
+        data:
+          value: "{{ summary[:255] }}"
+      - action: __NOTIFY_SERVICE__
+        data:
+          title: "Known plate at {{ trigger.payload_json.camera }}"
+          message: >-
+            {{ trigger.payload_json.plate }} ({{ ((trigger.payload_json.score | float(0)) * 100) | round(0) }}%) —
+            auto-open {{ 'ARMED' if armed else 'shadow mode' }}
+      - action: persistent_notification.create
+        data:
+          notification_id: "nvr_plate_{{ trigger.payload_json.camera }}"
+          title: "NVR known plate"
+          message: "{{ summary }}"
+      - if:
+          - condition: state
+            entity_id: input_boolean.nvr_garage_auto_open_armed
+            state: "on"
+          - condition: state
+            entity_id: cover.ratgdo32_9a2c58_door
+            state: "closed"
+          # 2-minute cooldown on the opener itself.
+          - condition: template
+            value_template: >-
+              {{ state_attr('script.nvr_garage_safe_open', 'last_triggered') is none
+                 or (now() - state_attr('script.nvr_garage_safe_open', 'last_triggered')).total_seconds() > 120 }}
+        then:
+          - action: script.nvr_garage_safe_open

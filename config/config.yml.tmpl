@@ -1,0 +1,197 @@
+# Frigate configuration TEMPLATE for cn-nvr (cerberus.lan).
+#
+# This file is tracked in git; setup.sh renders it to config/config.yml
+# (gitignored) by substituting ONLY ${NVR_PLATE_GONZALO}. The {FRIGATE_*}
+# placeholders are Frigate's own: it reads them from the container
+# environment at startup (mqtt/camera/onvif credentials never touch git).
+#
+# Workflow: edit zones, masks, cameras and plates in the Frigate UI (it
+# rewrites /config/config.yml) -> `scripts/config-pull.sh` lifts the result
+# back here with the plate re-masked -> commit. `setup.sh --render` discards
+# un-pulled UI edits, so pull first.
+
+mqtt:
+  enabled: true
+  # Mosquitto shares the ts-nvr network namespace.
+  host: 127.0.0.1
+  port: 1883
+  user: "{FRIGATE_MQTT_USER}"
+  password: "{FRIGATE_MQTT_PASSWORD}"
+  topic_prefix: frigate
+  client_id: frigate
+
+# Identity comes from the Authentik forward-auth gate in front of port 8971
+# (traefik-lan on the LAN, traefik-lab on the tailnet). Port 5000 stays the
+# internal, unauthenticated API used by Home Assistant and Prometheus.
+auth:
+  enabled: false
+tls:
+  enabled: false
+proxy:
+  header_map:
+    user: x-authentik-username
+    role: x-authentik-groups
+    role_map:
+      admin:
+        - infra-admins
+      viewer:
+        - cameras
+  # Authentik joins group names with a pipe.
+  separator: "|"
+  default_role: viewer
+  # Authentik forward_single sign-out endpoint on the protected host itself,
+  # so it works on both origins (nvr.cerberus.lan and nvr.lab.gn.al).
+  logout_url: /outpost.goauthentik.io/sign_out
+
+# Intel HD 530 (Skylake, Gen9): OpenVINO on the iGPU for detection, VAAPI for
+# decode. If the GPU plugin fails at startup, change device to CPU (AVX2 box,
+# plenty for two 5 fps detect streams) and watch frigate_detector_inference_speed_seconds.
+detectors:
+  ov:
+    type: openvino
+    device: GPU
+
+model:
+  width: 300
+  height: 300
+  input_tensor: nchw
+  input_pixel_format: bgr
+  path: /openvino-model/ssdlite_mobilenet_v2.xml
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+
+ffmpeg:
+  hwaccel_args: preset-vaapi
+
+# go2rtc pulls each Axis camera once (main stream for recording, a 720p/5fps
+# sub stream for detection) and restreams on rtsp://127.0.0.1:8554/<name>;
+# the same restream serves Home Assistant's camera entities via traefik-lan.
+go2rtc:
+  streams:
+    driveway:
+      - "rtsp://{FRIGATE_AXIS_USER}:{FRIGATE_AXIS_PASSWORD}@10.1.1.123:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15"
+    driveway_sub:
+      - "rtsp://{FRIGATE_AXIS_USER}:{FRIGATE_AXIS_PASSWORD}@10.1.1.123:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5"
+    ptz:
+      - "rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15"
+    ptz_sub:
+      - "rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5"
+
+objects:
+  track:
+    - person
+    - car
+    - dog
+    - cat
+    - motorcycle
+    - bicycle
+
+# Tiered retention (0.17+). Budget: two 1080p15 streams ~130 GB/day on the
+# 1.7 TB /srv volume -> 7 days continuous + 14 days motion is ~1-1.2 TB.
+# Frigate also prunes oldest segments itself when the volume runs low.
+record:
+  enabled: true
+  continuous:
+    days: 7
+  motion:
+    days: 14
+  alerts:
+    retain:
+      days: 30
+      mode: motion
+  detections:
+    retain:
+      days: 14
+      mode: motion
+
+snapshots:
+  enabled: true
+  retain:
+    default: 14
+
+review:
+  alerts:
+    labels:
+      - person
+      - car
+  detections:
+    labels:
+      - dog
+      - cat
+      - motorcycle
+      - bicycle
+
+birdseye:
+  enabled: true
+  mode: objects
+
+# Native web-push notifications (PWA, needs HTTPS on port 8971 - both Traefiks).
+notifications:
+  enabled: true
+
+# License plate recognition on CPU (AVX2). The known plate is rendered from
+# .env by setup.sh; the template keeps the token so the public repo never
+# carries the plate number. Add more known plates in the UI, then pull.
+lpr:
+  enabled: true
+  device: CPU
+  known_plates:
+    gonzalo_car:
+      - "${NVR_PLATE_GONZALO}"
+
+semantic_search:
+  enabled: false
+face_recognition:
+  enabled: false
+
+telemetry:
+  version_check: true
+
+cameras:
+  # AXIS P1465-LE-3 "License Plate Verifier Kit" - the driveway camera.
+  # Zones (e.g. driveway_approach) are drawn in the UI after bring-up.
+  driveway:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/driveway
+          input_args: preset-rtsp-restream
+          roles:
+            - record
+        - path: rtsp://127.0.0.1:8554/driveway_sub
+          input_args: preset-rtsp-restream
+          roles:
+            - detect
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+    lpr:
+      enabled: true
+
+  # AXIS P5655-E PTZ dome. ONVIF on port 80 for presets / click-to-move.
+  # Autotracking stays off until RelativeMove FOV support is verified.
+  ptz:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/ptz
+          input_args: preset-rtsp-restream
+          roles:
+            - record
+        - path: rtsp://127.0.0.1:8554/ptz_sub
+          input_args: preset-rtsp-restream
+          roles:
+            - detect
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+    lpr:
+      enabled: true
+    onvif:
+      host: 10.1.1.151
+      port: 80
+      user: "{FRIGATE_AXISPTZ_USER}"
+      password: "{FRIGATE_AXISPTZ_PASSWORD}"
+      autotracking:
+        enabled: false
