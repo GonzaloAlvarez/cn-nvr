@@ -75,6 +75,10 @@ go2rtc:
       - rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1920x1080&fps=15
     ptz_sub:
       - rtsp://{FRIGATE_AXISPTZ_USER}:{FRIGATE_AXISPTZ_PASSWORD}@10.1.1.151:554/axis-media/media.amp?videocodec=h264&resolution=1280x720&fps=5
+    # UniFi Protect doorbell: Protect streams are RTSPS; go2rtc's rtspx:// means
+    # RTSPS without SRTP (drop Protect's ?enableSrtp). Token URL lives in .env.
+    doorbell:
+      - '{FRIGATE_DOORBELL_STREAM}'
 
 objects:
   track:
@@ -202,4 +206,18 @@ cameras:
       ignore_time_mismatch: true
       autotracking:
         enabled: false
+
+  # UniFi Protect doorbell (10.1.1.90 via the Protect controller's RTSPS token
+  # stream). Single stream for record + detect; Frigate probes the resolution.
+  doorbell:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/doorbell
+          input_args: preset-rtsp-restream
+          roles:
+            - record
+            - detect
+    detect:
+      fps: 5
 version: 0.18-0

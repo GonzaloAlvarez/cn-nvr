@@ -144,6 +144,7 @@ services:
       - FRIGATE_AXISPTZ_PASSWORD=${FRIGATE_AXISPTZ_PASSWORD}
       - FRIGATE_AXISPTZ_ONVIF_USER=${FRIGATE_AXISPTZ_ONVIF_USER}
       - FRIGATE_AXISPTZ_ONVIF_PASSWORD=${FRIGATE_AXISPTZ_ONVIF_PASSWORD}
+      - FRIGATE_DOORBELL_STREAM=${FRIGATE_DOORBELL_STREAM}
     labels:
       com.centurylinklabs.watchtower.enable: "false"
       # offen v2 hook (archive-pre + /bin/sh -c, see cn-mzfxa): take a
