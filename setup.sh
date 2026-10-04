@@ -33,7 +33,7 @@ die() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 env_get() { grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- || true; }
 
 [[ -f .env ]] || die ".env not found. Run: kauket get cerberus.cn_nvr_env"
-for k in CERBERUS_IP HA_IP NVR_LAN_HOST GRAFANA_LAN_HOST INFRA_VPS_TAILNET_IP NVR_AUTHKEY \
+for k in CERBERUS_IP HA_IP NVR_LAN_HOST GRAFANA_LAN_HOST INFRA_VPS_TAILNET_IP NVR_AUTHKEY ADMIN_EMAIL \
          FRIGATE_MQTT_PASSWORD HA_MQTT_PASSWORD NVR_PLATE_GONZALO GF_ADMIN_PASSWORD; do
   [[ -n "$(env_get "$k")" ]] || die "$k is empty in .env"
 done
@@ -73,8 +73,8 @@ PASSWD_AFTER="$(sudo sha256sum mosquitto/passwd | cut -d' ' -f1)"
 
 # ── Frigate config: template -> rendered (plate only) ───────────────────────
 render_config() {
-  NVR_PLATE_GONZALO="$(env_get NVR_PLATE_GONZALO)" \
-    envsubst '${NVR_PLATE_GONZALO}' < config/config.yml.tmpl
+  NVR_PLATE_GONZALO="$(env_get NVR_PLATE_GONZALO)" NVR_ADMIN_EMAIL="$(env_get ADMIN_EMAIL)" \
+    envsubst '${NVR_PLATE_GONZALO} ${NVR_ADMIN_EMAIL}' < config/config.yml.tmpl
 }
 mkdir -p config
 if [[ ! -f config/config.yml ]]; then

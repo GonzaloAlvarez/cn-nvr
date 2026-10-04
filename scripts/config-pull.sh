@@ -13,12 +13,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ -f .env ]] || { echo "no .env (kauket get cerberus.cn_nvr_env)" >&2; exit 1; }
 [[ -f config/config.yml ]] || { echo "no config/config.yml to pull" >&2; exit 1; }
 PLATE="$(grep -E '^NVR_PLATE_GONZALO=' .env | cut -d= -f2-)"
-[[ -n "$PLATE" ]] || { echo "NVR_PLATE_GONZALO is empty in .env" >&2; exit 1; }
+EMAIL="$(grep -E '^ADMIN_EMAIL=' .env | cut -d= -f2-)"
+[[ -n "$PLATE" && -n "$EMAIL" ]] || { echo "NVR_PLATE_GONZALO / ADMIN_EMAIL empty in .env" >&2; exit 1; }
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-# Mask the plate (literal match; plates are letters/digits).
-sed "s/${PLATE}/\${NVR_PLATE_GONZALO}/g" config/config.yml > "$tmp"
+# Mask the plate (literal match; plates are letters/digits) and the notification e-mail.
+sed -e "s/${PLATE}/\${NVR_PLATE_GONZALO}/g" -e "s/${EMAIL//./\\.}/\${NVR_ADMIN_EMAIL}/g" config/config.yml > "$tmp"
 
 grep -q '{FRIGATE_MQTT_PASSWORD}' "$tmp" \
   || { echo "REFUSING: {FRIGATE_*} placeholders missing from config.yml - the UI expanded credentials; restore from git and edit by hand" >&2; exit 1; }

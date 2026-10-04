@@ -125,8 +125,10 @@ birdseye:
   mode: objects
 
 # Native web-push notifications (PWA, needs HTTPS on port 8971 - both Traefiks).
+# email = VAPID contact, rendered from ADMIN_EMAIL by setup.sh (kept out of git).
 notifications:
   enabled: true
+  email: "${NVR_ADMIN_EMAIL}"
 
 # License plate recognition on CPU (AVX2). The known plate is rendered from
 # .env by setup.sh; the template keeps the token so the public repo never

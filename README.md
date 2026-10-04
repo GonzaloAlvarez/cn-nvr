@@ -64,10 +64,10 @@ Single-file binds (`traefik-lan/dynamic.yml`, `promtail/promtail.yml`, `mosquitt
 
 ## Frigate configuration: template → rendered → pull back
 
-The public repo tracks `config/config.yml.tmpl`; the live `/config/config.yml` is rendered by `setup.sh` (only `${NVR_PLATE_GONZALO}` is substituted; Frigate itself substitutes `{FRIGATE_*}` credentials from the container environment) and is gitignored. The Frigate UI (zones, masks, cameras, known plates) writes the live file.
+The public repo tracks `config/config.yml.tmpl`; the live `/config/config.yml` is rendered by `setup.sh` (only `${NVR_PLATE_GONZALO}` and `${NVR_ADMIN_EMAIL}` are substituted; Frigate itself substitutes `{FRIGATE_*}` credentials from the container environment) and is gitignored. The Frigate UI (zones, masks, cameras, known plates) writes the live file.
 
 1. Edit in the UI → *Save*.
-2. `scripts/config-pull.sh` → copies the live file over the template with the plate re-masked, refuses if credentials were expanded or the plate token vanished (plate changed? update `NVR_PLATE_GONZALO` in Kauket first).
+2. `scripts/config-pull.sh` → copies the live file over the template with the plate and e-mail re-masked, refuses if credentials were expanded or the plate token vanished (plate changed? update `NVR_PLATE_GONZALO` in Kauket first).
 3. `git diff config/config.yml.tmpl`, commit, push (from the Mac after `scp`/`git pull`, or from the host with push rights).
 
 `./setup.sh --render` re-renders from the template and refuses if un-pulled UI edits would be lost (`--force` discards them). After the first UI save, confirm `grep -c '{FRIGATE_' config/config.yml` is unchanged.
