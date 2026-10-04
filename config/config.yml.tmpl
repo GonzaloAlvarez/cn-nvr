@@ -197,6 +197,9 @@ cameras:
       port: 80
       user: '{FRIGATE_AXISPTZ_ONVIF_USER}'
       password: '{FRIGATE_AXISPTZ_ONVIF_PASSWORD}'
+      # The P5655-E's clock drifts/was ~7 h off (2026-10-04): WS-Security digests
+      # then fail as "Sender not authorized". Let Frigate compensate for the offset.
+      ignore_time_mismatch: true
       autotracking:
         enabled: false
 version: 0.18-0
