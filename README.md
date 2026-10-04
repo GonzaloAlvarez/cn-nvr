@@ -112,6 +112,7 @@ Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S
 
 ## Troubleshooting
 
+- **Detector crash-loop / Frigate restarting / HA shows 500-502 from :5000** — `docker logs cn-nvr-frigate-1 | grep -A3 'Process frigate.detector'`; a `could not broadcast input array` ValueError means the `model.input_tensor` layout is wrong for the model (the bundled OpenVINO SSDLite is `nhwc`). Frigate's watchdog restarts the detector forever and the API flaps.
 - **Detector slow / CPU pegged** — `docker compose logs frigate | grep -i openvino`; if the GPU plugin failed, set `detectors.ov.device: CPU` in the template, `./setup.sh --render`, recreate frigate. `FrigateDetectorSlow` (>100 ms) is the alert.
 - **Camera 0 fps** — RTSP/credentials: `docker exec cn-nvr-frigate-1 ffprobe rtsp://127.0.0.1:8554/driveway`; the go2rtc page is `http://127.0.0.1:15000` → *System* → go2rtc.
 - **`TRAEFIK DEFAULT CERT`** — HTTP-01 failed: the name must exist in Technitium and as a pfSense Host Override, UFW must allow 80 from pki, `pki.lan` is pinned in `extra_hosts`.
