@@ -56,14 +56,20 @@ NVR_LAN_HOST="$(env_get NVR_LAN_HOST)" GRAFANA_LAN_HOST="$(env_get GRAFANA_LAN_H
 INFRA_VPS_TAILNET_IP="$(env_get INFRA_VPS_TAILNET_IP)" \
   envsubst '${INFRA_VPS_TAILNET_IP}' < promtail/promtail.yml.tmpl > promtail/promtail.yml
 
-# Mosquitto password file: plaintext written with umask 077, hashed in place
-# by mosquitto_passwd inside the image (no secrets on a command line).
+# Mosquitto password file: plaintext written with umask 077 to a temp file,
+# hashed in place by mosquitto_passwd inside the image (no secrets on a
+# command line), then installed root:1883 0640 — Mosquitto insists the file
+# be root-owned (warns today, refuses in future versions) and reads it as
+# the mosquitto user (gid 1883); the host user reads it only via sudo.
 log "rendering mosquitto/passwd"
-PASSWD_BEFORE="$(sha256sum mosquitto/passwd 2>/dev/null | cut -d' ' -f1 || true)"
-( umask 077; printf 'frigate:%s\nhomeassistant:%s\n' "$(env_get FRIGATE_MQTT_PASSWORD)" "$(env_get HA_MQTT_PASSWORD)" > mosquitto/passwd )
-docker run --rm -v "$PWD/mosquitto:/work" eclipse-mosquitto:2 \
-  sh -c 'mosquitto_passwd -U /work/passwd && chown 1883:1883 /work/passwd && chmod 600 /work/passwd' >/dev/null
-PASSWD_AFTER="$(sha256sum mosquitto/passwd | cut -d' ' -f1)"
+PASSWD_BEFORE="$(sudo sha256sum mosquitto/passwd 2>/dev/null | cut -d' ' -f1 || true)"
+tmp_pw="$(mktemp mosquitto/.passwd.XXXXXX)"
+( umask 077; printf 'frigate:%s\nhomeassistant:%s\n' "$(env_get FRIGATE_MQTT_PASSWORD)" "$(env_get HA_MQTT_PASSWORD)" > "$tmp_pw" )
+docker run --rm -v "$PWD/mosquitto:/work" eclipse-mosquitto:2 mosquitto_passwd -U "/work/$(basename "$tmp_pw")" >/dev/null 2>&1 \
+  || { sudo rm -f "$tmp_pw"; die "mosquitto_passwd failed"; }
+sudo install -o root -g 1883 -m 0640 "$tmp_pw" mosquitto/passwd
+sudo rm -f "$tmp_pw"
+PASSWD_AFTER="$(sudo sha256sum mosquitto/passwd | cut -d' ' -f1)"
 
 # ── Frigate config: template -> rendered (plate only) ───────────────────────
 render_config() {
