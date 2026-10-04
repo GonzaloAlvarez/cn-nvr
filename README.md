@@ -72,7 +72,7 @@ The public repo tracks `config/config.yml.tmpl`; the live `/config/config.yml` i
 
 `./setup.sh --render` re-renders from the template and refuses if un-pulled UI edits would be lost (`--force` discards them). After the first UI save, confirm `grep -c '{FRIGATE_' config/config.yml` is unchanged.
 
-Cameras: `driveway` = AXIS P1465-LE-3 (10.1.1.123), `ptz` = AXIS P5655-E (10.1.1.151, ONVIF :80). Streams are pulled once by go2rtc (1080p15 record, 720p5 detect) and restreamed on `rtsp://127.0.0.1:8554/<name>`. Camera credentials are `.env` → `{FRIGATE_AXIS_*}` / `{FRIGATE_AXISPTZ_*}`; passwords are embedded in RTSP URLs, so keep them URL-safe.
+Cameras: `driveway` = AXIS P1465-LE-3 (10.1.1.123), `ptz` = AXIS P5655-E (10.1.1.151, ONVIF :80). Streams are pulled once by go2rtc (1080p15 record, 720p5 detect) and restreamed on `rtsp://127.0.0.1:8554/<name>`. Camera credentials are `.env` → `{FRIGATE_AXIS_*}` / `{FRIGATE_AXISPTZ_*}` (RTSP) and `{FRIGATE_AXISPTZ_ONVIF_*}` (PTZ); passwords are embedded in RTSP URLs, so keep them URL-safe. Axis keeps ONVIF accounts separate from device accounts (System → ONVIF → Accounts); a missing ONVIF account shows up as `Onvif connection failed … Sender not authorized` and no PTZ controls in the UI.
 
 ## Home Assistant
 

@@ -76,19 +76,31 @@ render_config() {
   NVR_PLATE_GONZALO="$(env_get NVR_PLATE_GONZALO)" NVR_ADMIN_EMAIL="$(env_get ADMIN_EMAIL)" \
     envsubst '${NVR_PLATE_GONZALO} ${NVR_ADMIN_EMAIL}' < config/config.yml.tmpl
 }
+# The live file is "untouched" when its hash equals the hash recorded at the
+# last render (config/.config.rendered.sha256); a template that evolved since
+# is fine to re-render, UI edits that were never pulled are not.
 mkdir -p config
+HASH_FILE=config/.config.rendered.sha256
+live_untouched() {
+  [[ -f config/config.yml ]] || return 1
+  if [[ -f "$HASH_FILE" ]]; then [[ "$(sha256sum config/config.yml | cut -d' ' -f1)" == "$(cat "$HASH_FILE")" ]]
+  else diff -q <(render_config) config/config.yml >/dev/null; fi
+}
+do_render() { render_config > config/config.yml; sha256sum config/config.yml | cut -d' ' -f1 > "$HASH_FILE"; }
 if [[ ! -f config/config.yml ]]; then
   log "rendering config/config.yml from the template (first run)"
-  render_config > config/config.yml
+  do_render
 elif (( RENDER )); then
-  if ! diff -q <(render_config) config/config.yml >/dev/null && (( ! FORCE )); then
-    die "config/config.yml differs from the rendered template (UI edits not pulled?). Run scripts/config-pull.sh first, or --render --force to discard them."
+  if ! live_untouched && (( ! FORCE )); then
+    die "config/config.yml was edited since the last render (UI edits not pulled?). Run scripts/config-pull.sh first, or --render --force to discard them."
   fi
   log "re-rendering config/config.yml from the template"
-  render_config > config/config.yml
+  do_render
 else
   if diff -q <(render_config) config/config.yml >/dev/null; then
     log "config/config.yml matches the template"
+  elif live_untouched; then
+    log "NOTE: the template changed since the last render — run ./setup.sh --render to apply it"
   else
     log "NOTE: config/config.yml has edits not in the template (UI changes) — run scripts/config-pull.sh to commit them; setup.sh leaves the live file alone"
   fi

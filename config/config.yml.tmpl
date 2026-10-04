@@ -171,6 +171,8 @@ cameras:
       enabled: true
 
   # AXIS P5655-E PTZ dome. ONVIF on port 80 for presets / click-to-move.
+  # Axis keeps ONVIF accounts separate from device accounts: the ONVIF user
+  # (FRIGATE_AXISPTZ_ONVIF_*) is not the RTSP user (FRIGATE_AXISPTZ_*).
   # Autotracking stays off until RelativeMove FOV support is verified.
   ptz:
     enabled: true
@@ -193,8 +195,8 @@ cameras:
     onvif:
       host: 10.1.1.151
       port: 80
-      user: '{FRIGATE_AXISPTZ_USER}'
-      password: '{FRIGATE_AXISPTZ_PASSWORD}'
+      user: '{FRIGATE_AXISPTZ_ONVIF_USER}'
+      password: '{FRIGATE_AXISPTZ_ONVIF_PASSWORD}'
       autotracking:
         enabled: false
 version: 0.18-0
