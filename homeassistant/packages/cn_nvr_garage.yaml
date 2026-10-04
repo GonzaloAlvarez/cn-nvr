@@ -4,16 +4,31 @@
 # packages: !include_dir_named packages`). __NOTIFY_SERVICE__ is replaced at
 # deploy time (default notify.mobile_app_iphone18gon).
 #
-# Shadow mode by default: the arrival automation notifies and records every
-# recognised plate, but only operates the door when
-# input_boolean.nvr_garage_auto_open_armed is on. The opener script locks the
-# wireless remotes first (ratgdo "Lock remotes"), so a visor-remote press
-# during the automated open cannot stop the door halfway; a safety reset
-# unlocks the remotes if anything leaves them locked.
+# Arming: input_boolean.nvr_garage_auto_open_armed is the kill switch (state
+# survives restarts). Off = shadow mode: every recognised plate is recorded
+# and pushed, the door is never touched. On = the arrival automation calls
+# script.nvr_garage_safe_open when every guard below passes.
+#
+# "Opened by HA" contract (input_boolean.nvr_garage_opened_by_ha):
+#   * the opener script sets it before it touches the door and blocks the
+#     controller for the whole HA-driven open: ratgdo "Lock remotes" is
+#     engaged first (confirmed, else abort) and only released once the door
+#     reports fully open (or 30 s), so a visor-remote press cannot stop or
+#     reverse the door mid-travel;
+#   * while it is on, the arrival automation refuses to fire again;
+#   * it clears itself when the door reports closed (automation below).
+# A safety automation releases the remote lock if anything leaves it engaged
+# for more than a minute.
+#
+# Other guards on the opener branch: door must have been closed for at least
+# departure_guard_s (a late plate read of the car you just drove away in must
+# not reopen the house), the same Frigate tracked object never opens twice,
+# 2-minute opener cooldown, opener not already running.
 #
 # Signals from Frigate (MQTT frigate/tracked_object_update, type=lpr):
 #   name   known-plate label from lpr.known_plates (null for unknown plates)
-#   score  OCR confidence 0..1, camera, plate, timestamp
+#   id     Frigate tracked-object id; score OCR confidence 0..1; plate,
+#   camera, timestamp
 # Later second factors (see README): zone occupancy
 # (binary_sensor.<camera>_<zone>_car_occupancy once zones exist) and a Frigate
 # vehicle-identity classifier.
@@ -22,6 +37,9 @@ input_boolean:
   nvr_garage_auto_open_armed:
     name: "NVR: auto-open garage on known plate"
     icon: mdi:garage-open
+  nvr_garage_opened_by_ha:
+    name: "NVR: garage opened by HA (clears when it closes)"
+    icon: mdi:robot
 
 input_number:
   nvr_lpr_min_score:
@@ -38,35 +56,67 @@ input_text:
     name: "NVR: last known-plate event"
     icon: mdi:license
     max: 255
+  nvr_last_plate_object_id:
+    name: "NVR: Frigate object that last opened the garage"
+    icon: mdi:identifier
+    max: 64
 
 script:
   nvr_garage_safe_open:
-    alias: "NVR: safe garage open (lock remotes -> open -> unlock)"
+    alias: "NVR: safe garage open (block remotes -> open -> release)"
     icon: mdi:garage-open-variant
     mode: single
     sequence:
+      # Latch first: from here on "HA is driving the door".
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.nvr_garage_opened_by_ha
       - action: lock.lock
         target:
           entity_id: lock.ratgdo32_9a2c58_lock_remotes
       # Do not move the door until the opener confirms the remotes are
-      # locked; a silent ratgdo means we abort instead of racing a remote.
+      # blocked (measured ~0.2 s); a silent ratgdo means abort, never race.
       - wait_template: "{{ is_state('lock.ratgdo32_9a2c58_lock_remotes', 'locked') }}"
-        timeout: "00:00:02"
-        continue_on_timeout: false
+        timeout: "00:00:05"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.nvr_garage_opened_by_ha
+          - action: persistent_notification.create
+            data:
+              notification_id: nvr_garage_opener
+              title: "NVR garage opener aborted"
+              message: "ratgdo did not confirm the remote lock within 5 s; the door was left untouched."
+          - stop: "remotes not confirmed locked"
+            error: true
       - action: cover.open_cover
         target:
           entity_id: cover.ratgdo32_9a2c58_door
+      # Remotes stay blocked until the door reports fully open (or 30 s).
       - wait_template: "{{ is_state('cover.ratgdo32_9a2c58_door', 'open') }}"
         timeout: "00:00:30"
         continue_on_timeout: true
       - action: lock.unlock
         target:
           entity_id: lock.ratgdo32_9a2c58_lock_remotes
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: nvr_garage_opener
+              title: "NVR garage opener"
+              message: "The door did not report open within 30 s of the HA open command (state: {{ states('cover.ratgdo32_9a2c58_door') }}). Remotes released."
 
 automation:
   - id: nvr_remote_lock_safety_reset
     alias: "NVR: remote-lock safety reset"
-    description: "Never leave the wireless remotes locked for more than a minute."
+    description: "Never leave the wireless remotes blocked for more than a minute."
     mode: single
     triggers:
       - trigger: state
@@ -78,9 +128,23 @@ automation:
         target:
           entity_id: lock.ratgdo32_9a2c58_lock_remotes
 
+  - id: nvr_garage_opened_by_ha_clear
+    # HA derives the entity id from the alias, so keep it aligned with the id.
+    alias: "NVR: garage opened-by-HA clear"
+    description: "The HA-open cycle ends when the door reports closed (also covers a restart while it was open)."
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: cover.ratgdo32_9a2c58_door
+        to: "closed"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.nvr_garage_opened_by_ha
+
   - id: nvr_known_plate_arrival
     alias: "NVR: known plate arrival"
-    description: "Frigate recognised a known plate on a driveway camera: notify; open the garage only when armed."
+    description: "Frigate recognised a known plate on a driveway camera: notify; open the garage when armed and every guard passes."
     mode: single
     max_exceeded: silent
     variables:
@@ -88,6 +152,8 @@ automation:
       allowed_cameras:
         - driveway
         - ptz
+      # the door must have been closed at least this long (seconds)
+      departure_guard_s: 180
     triggers:
       - trigger: mqtt
         topic: frigate/tracked_object_update
@@ -101,11 +167,29 @@ automation:
              and trigger.payload_json.camera in allowed_cameras }}
     actions:
       - variables:
+          object_id: "{{ trigger.payload_json.id | default('') }}"
+          pct: "{{ ((trigger.payload_json.score | float(0)) * 100) | round(0) | int }}"
           armed: "{{ is_state('input_boolean.nvr_garage_auto_open_armed', 'on') }}"
+          door_closed_s: >-
+            {{ (now() - states.cover.ratgdo32_9a2c58_door.last_changed).total_seconds() | int
+               if is_state('cover.ratgdo32_9a2c58_door', 'closed') else -1 }}
+          # empty string = every guard passed; otherwise the first reason not to open
+          blocker: >-
+            {%- set door = states('cover.ratgdo32_9a2c58_door') -%}
+            {%- set lt = state_attr('script.nvr_garage_safe_open', 'last_triggered') -%}
+            {%- if not armed -%} shadow mode
+            {%- elif is_state('input_boolean.nvr_garage_opened_by_ha', 'on') -%} HA already opened the door
+            {%- elif door != 'closed' -%} door is {{ door }}
+            {%- elif door_closed_s < departure_guard_s -%} door closed only {{ door_closed_s }}s ago (departure guard)
+            {%- elif object_id != '' and object_id == states('input_text.nvr_last_plate_object_id') -%} tracked object {{ object_id }} already opened the door
+            {%- elif is_state('script.nvr_garage_safe_open', 'on') -%} opener already running
+            {%- elif lt is not none and (now() - lt).total_seconds() < 120 -%} opener cooldown
+            {%- endif -%}
+          will_open: "{{ blocker == '' }}"
           summary: >-
             {{ now().strftime('%Y-%m-%d %H:%M') }} {{ trigger.payload_json.plate }}
-            {{ ((trigger.payload_json.score | float(0)) * 100) | round(0) }}% @{{ trigger.payload_json.camera }}
-            armed={{ armed }}
+            {{ pct }}% @{{ trigger.payload_json.camera }}
+            armed={{ armed }} {{ 'OPENING' if will_open else 'no-open: ' ~ blocker }}
       - action: input_text.set_value
         target:
           entity_id: input_text.nvr_last_plate_event
@@ -115,24 +199,20 @@ automation:
         data:
           title: "Known plate at {{ trigger.payload_json.camera }}"
           message: >-
-            {{ trigger.payload_json.plate }} ({{ ((trigger.payload_json.score | float(0)) * 100) | round(0) }}%) —
-            auto-open {{ 'ARMED' if armed else 'shadow mode' }}
+            {{ trigger.payload_json.plate }} ({{ pct }}%) —
+            {{ 'opening the garage' if will_open else 'not opening: ' ~ blocker }}
       - action: persistent_notification.create
         data:
           notification_id: "nvr_plate_{{ trigger.payload_json.camera }}"
           title: "NVR known plate"
           message: "{{ summary }}"
       - if:
-          - condition: state
-            entity_id: input_boolean.nvr_garage_auto_open_armed
-            state: "on"
-          - condition: state
-            entity_id: cover.ratgdo32_9a2c58_door
-            state: "closed"
-          # 2-minute cooldown on the opener itself.
           - condition: template
-            value_template: >-
-              {{ state_attr('script.nvr_garage_safe_open', 'last_triggered') is none
-                 or (now() - state_attr('script.nvr_garage_safe_open', 'last_triggered')).total_seconds() > 120 }}
+            value_template: "{{ will_open }}"
         then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.nvr_last_plate_object_id
+            data:
+              value: "{{ object_id[:64] }}"
           - action: script.nvr_garage_safe_open

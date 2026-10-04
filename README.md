@@ -84,9 +84,26 @@ HA talks to Frigate over the LAN, never through the browser gate (forward-auth i
 | Frigate integration (HACS, `blakeblackshear/frigate-hass-integration`) | URL `http://10.0.0.230:5000`, no username/password; camera entities stream `rtsp://10.0.0.230:8554/<camera>` |
 | Package | `homeassistant/packages/cn_nvr_garage.yaml` via `homeassistant/deploy-ha.sh [--notify notify.<device>] [--restart]` |
 
-The package ships in **shadow mode**: `automation.nvr_known_plate_arrival` fires on `frigate/tracked_object_update` (`type: lpr`, `name: gonzalo_car`, score ≥ `input_number.nvr_lpr_min_score`, camera in `driveway`/`ptz`), records `input_text.nvr_last_plate_event`, pushes a notification, and only when `input_boolean.nvr_garage_auto_open_armed` is on, the door is closed and the opener has not run in 2 minutes does it call `script.nvr_garage_safe_open`: lock the ratgdo wireless remotes → wait for `locked` (abort after 2 s) → open → wait for `open` (≤30 s) → unlock. `automation.nvr_remote_lock_safety_reset` unlocks the remotes if they stay locked for a minute. The pre-existing 23:00 "Close Garage Door" automation is untouched.
+The package is **armed** since 2026-10-04 (one real shadow-mode arrival verified the trigger path first); `input_boolean.nvr_garage_auto_open_armed` is the kill switch and survives restarts — off means shadow mode (notifications only). `automation.nvr_known_plate_arrival` fires on `frigate/tracked_object_update` (`type: lpr`, `name: gonzalo_car`, score ≥ `input_number.nvr_lpr_min_score`, camera in `driveway`/`ptz`), records `input_text.nvr_last_plate_event`, pushes a notification that says *opening the garage* or *not opening: <reason>*, and calls `script.nvr_garage_safe_open` only when every guard passes:
 
-Run in shadow mode for a few days of real arrivals (check scores in the input_text and Frigate's *Explore* view), then arm with the switch. Later second factors: a zone-occupancy condition (`binary_sensor.<camera>_<zone>_car_occupancy`, once the `driveway_approach` zone exists) and a Frigate custom vehicle-identity classifier (train on the car, not the plate).
+| Guard | Why |
+|---|---|
+| armed switch on | kill switch / shadow mode |
+| `input_boolean.nvr_garage_opened_by_ha` off | HA already opened the door and it has not closed since |
+| door `closed` for ≥ 180 s | departure guard: a late read of your own plate as you drive away must not reopen the house |
+| Frigate object `id` ≠ `input_text.nvr_last_plate_object_id` | the same sighting never opens the door twice |
+| opener not running, not run in the last 2 min | cooldown |
+
+The opener **blocks the controller for the whole HA-driven open**: it latches `nvr_garage_opened_by_ha`, engages the ratgdo *Lock remotes* and waits for the opener to confirm (~0.2 s measured on the real device; aborts with a persistent notification after 5 s and never moves the door), sends `cover.open_cover`, keeps the remotes locked until the door reports `open` (≤ 30 s, so a visor-remote press cannot stop or reverse it mid-travel), then releases them. The latch clears when the door reports `closed` (`automation.nvr_garage_opened_by_ha_clear`); `automation.nvr_remote_lock_safety_reset` releases the remotes if anything leaves them locked for a minute. The pre-existing 23:00 "Close Garage Door" automation is untouched; the ratgdo wall button is outside the lock's reach by design. Known limitation until a second factor exists: any *new* Frigate tracked object carrying the plate opens the door, including a parked car the tracker re-acquires in view of the driveway cameras.
+
+Tests that do not move the door — publish a synthetic event through HA itself (REST `POST /api/services/mqtt/publish`, token `homeiot.ha_api_token`) while a guard is known to block, e.g. with `input_boolean.nvr_garage_opened_by_ha` switched on by hand:
+
+```json
+{"topic": "frigate/tracked_object_update",
+ "payload": "{\"type\":\"lpr\",\"name\":\"gonzalo_car\",\"plate\":\"SYNTHETIC\",\"score\":0.99,\"id\":\"synthetic-1\",\"camera\":\"driveway\",\"timestamp\":0}"}
+```
+
+The push and `input_text.nvr_last_plate_event` must read `not opening: HA already opened the door` and `script.nvr_garage_safe_open` must not have run; switch the latch off afterwards. To exercise the opener itself, run the script from Developer tools with the door closed and watch `lock.ratgdo32_9a2c58_lock_remotes` go `locked` → door `open` → `unlocked`. Later second factors: a zone-occupancy condition (`binary_sensor.<camera>_<zone>_car_occupancy`, once the `driveway_approach` zone exists) and a Frigate custom vehicle-identity classifier (train on the car, not the plate).
 
 ## State, backup, restore
 
