@@ -54,8 +54,6 @@ detectors:
 model:
   width: 300
   height: 300
-  # SSDLite MobileNet v2 (bundled) takes NHWC; nchw crashes the detector on the
-  # first frame ("could not broadcast (1,3,300,300) into (1,300,300,3)").
   input_tensor: nhwc
   input_pixel_format: bgr
   path: /openvino-model/ssdlite_mobilenet_v2.xml
@@ -223,3 +221,4 @@ cameras:
     detect:
       fps: 5
 version: 0.18-0
+camera_groups: {}
