@@ -29,6 +29,18 @@
 #   name   known-plate label from lpr.known_plates (null for unknown plates)
 #   id     Frigate tracked-object id; score OCR confidence 0..1; plate,
 #   camera, timestamp
+# Departure -> close (2026-10-24, input_boolean.nvr_garage_auto_close_armed,
+# shipped OFF = shadow mode):
+#   "leaving" = sensor.frigate_gonzalo_car_last_camera (Frigate integration,
+#   fed by the same LPR reads) flips PTZ -> Driveway: the PTZ dome reads the
+#   plate while the car backs out with the door open, then the driveway camera
+#   reads it on the way down. Every real departure 2026-10-14..17 produced
+#   exactly that transition within 10-70 s; arrivals never do (the driveway
+#   camera reads first). Guards: transition within 5 min, door open, no HA
+#   arrival cycle (opened_by_ha off), no obstruction, PTZ camera quiet
+#   (Frigate motion off, which already implies mqtt_off_delay 30 s of no
+#   motion, and no person) for up to 3 min. The opener's safety beam stays the
+#   last line of defence. Off = notify "would close", never touch the door.
 # Later second factors (see README): zone occupancy
 # (binary_sensor.<camera>_<zone>_car_occupancy once zones exist) and a Frigate
 # vehicle-identity classifier.
@@ -40,6 +52,9 @@ input_boolean:
   nvr_garage_opened_by_ha:
     name: "NVR: garage opened by HA (clears when it closes)"
     icon: mdi:robot
+  nvr_garage_auto_close_armed:
+    name: "NVR: auto-close garage after known-plate departure"
+    icon: mdi:garage-lock
 
 input_number:
   nvr_lpr_min_score:
@@ -60,6 +75,10 @@ input_text:
     name: "NVR: Frigate object that last opened the garage"
     icon: mdi:identifier
     max: 64
+  nvr_last_departure_event:
+    name: "NVR: last known-plate departure"
+    icon: mdi:car-arrow-right
+    max: 255
 
 script:
   nvr_garage_safe_open:
@@ -216,3 +235,98 @@ automation:
             data:
               value: "{{ object_id[:64] }}"
           - action: script.nvr_garage_safe_open
+
+  - id: nvr_known_plate_departure
+    # HA derives the entity id from the alias, so keep it aligned with the id.
+    alias: "NVR: known plate departure"
+    description: "The known car was read by the PTZ dome and then by the driveway camera: the car is leaving. Close the garage once the PTZ camera is quiet, when armed and every guard passes."
+    mode: single
+    max_exceeded: silent
+    variables:
+      # the PTZ read must be this recent for the driveway read to count as leaving
+      departure_window_s: 300
+    triggers:
+      - trigger: state
+        entity_id: sensor.frigate_gonzalo_car_last_camera
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none and trigger.to_state is not none
+             and trigger.from_state.state | lower == 'ptz'
+             and trigger.to_state.state | lower == 'driveway'
+             and (now() - trigger.from_state.last_changed).total_seconds() <= departure_window_s }}
+    actions:
+      - variables:
+          armed: "{{ is_state('input_boolean.nvr_garage_auto_close_armed', 'on') }}"
+          # empty string = the door may be closed once the PTZ camera is quiet
+          hard_blocker: >-
+            {%- set door = states('cover.ratgdo32_9a2c58_door') -%}
+            {%- if door != 'open' -%} door is {{ door }}
+            {%- elif is_state('input_boolean.nvr_garage_opened_by_ha', 'on') -%} HA arrival cycle in progress
+            {%- elif is_state('binary_sensor.ratgdo32_9a2c58_obstruction', 'on') -%} obstruction reported
+            {%- endif -%}
+      # "No movement on the PTZ camera": Frigate's motion sensor stays on for
+      # mqtt_off_delay (30 s) after the last motion, so off already means a
+      # quiet scene; a person standing still in view also blocks. A hard
+      # blocker makes the template true at once so nothing waits for nothing.
+      - wait_template: >-
+          {{ hard_blocker != ''
+             or (is_state('binary_sensor.ptz_motion', 'off')
+                 and is_state('binary_sensor.ptz_person_occupancy', 'off')) }}
+        timeout: "00:03:00"
+        continue_on_timeout: true
+      - variables:
+          # re-evaluate after the wait: the door may have been closed by hand meanwhile
+          blocker: >-
+            {%- set door = states('cover.ratgdo32_9a2c58_door') -%}
+            {%- if hard_blocker != '' -%} {{ hard_blocker }}
+            {%- elif not wait.completed -%} movement on the PTZ camera for 3 min
+            {%- elif door != 'open' -%} door is {{ door }} now
+            {%- elif is_state('input_boolean.nvr_garage_opened_by_ha', 'on') -%} HA arrival cycle in progress
+            {%- elif is_state('binary_sensor.ratgdo32_9a2c58_obstruction', 'on') -%} obstruction reported
+            {%- elif not armed -%} shadow mode
+            {%- endif -%}
+          will_close: "{{ blocker == '' }}"
+          summary: >-
+            {{ now().strftime('%Y-%m-%d %H:%M') }} departure PTZ->driveway
+            armed={{ armed }} {{ 'CLOSING' if will_close else 'no-close: ' ~ blocker }}
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.nvr_last_departure_event
+        data:
+          value: "{{ summary[:255] }}"
+      - action: __NOTIFY_SERVICE__
+        data:
+          title: "Known plate leaving"
+          message: >-
+            {{ 'closing the garage' if will_close
+               else ('would close the garage (shadow mode: turn on NVR auto-close to enable)' if blocker == 'shadow mode'
+                     else 'not closing: ' ~ blocker) }}
+      - action: persistent_notification.create
+        data:
+          notification_id: nvr_departure
+          title: "NVR known plate departure"
+          message: "{{ summary }}"
+      - if:
+          - condition: template
+            value_template: "{{ will_close }}"
+        then:
+          - action: cover.close_cover
+            target:
+              entity_id: cover.ratgdo32_9a2c58_door
+          - wait_template: "{{ is_state('cover.ratgdo32_9a2c58_door', 'closed') }}"
+            timeout: "00:00:30"
+            continue_on_timeout: true
+          - if:
+              - condition: template
+                value_template: "{{ not wait.completed }}"
+            then:
+              - action: persistent_notification.create
+                data:
+                  notification_id: nvr_departure
+                  title: "NVR garage auto-close"
+                  message: "The door did not report closed within 30 s of the HA close command (state: {{ states('cover.ratgdo32_9a2c58_door') }}). Check the opener."
+              - action: __NOTIFY_SERVICE__
+                data:
+                  title: "Garage auto-close"
+                  message: "The door did not report closed within 30 s (state: {{ states('cover.ratgdo32_9a2c58_door') }})."
