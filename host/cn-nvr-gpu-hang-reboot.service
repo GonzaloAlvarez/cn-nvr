@@ -1,0 +1,10 @@
+[Unit]
+Description=cn-nvr: reboot the host when the iGPU is hung (nightly window only)
+Documentation=https://github.com/GonzaloAlvarez/cn-nvr#gpu-hang-conditional-reboot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/cn-nvr/gpu-hang-reboot.sh
+# Window and guards are defaults inside the script; override here if ever needed:
+#Environment=WINDOW_START=4 WINDOW_END=6 TZ_NAME=America/New_York
