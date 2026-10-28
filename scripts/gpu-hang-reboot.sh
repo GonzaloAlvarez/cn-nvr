@@ -16,7 +16,7 @@
 #   * the local hour is in [WINDOW_START, WINDOW_END) in TZ_NAME (default 04–06 ET)
 #   * uptime ≥ MIN_UPTIME_MIN (a hang right after boot never loops the host)
 #   * this script has not rebooted the host yet today (TZ_NAME date) — one shot
-# Usage: gpu-hang-reboot.sh [--check]   (--check prints the decision, never reboots)
+# Usage: gpu-hang-reboot.sh [--check]   (--check prints the decision; never reboots, never writes metrics)
 set -euo pipefail
 
 TZ_NAME="${TZ_NAME:-America/New_York}"
@@ -54,7 +54,7 @@ will_reboot=0; (( hung_now )) && [[ -z "$reason" ]] && will_reboot=1
 pending=0; (( hung_now && ! will_reboot )) && pending=1
 
 # ── metrics (atomic write) ─────────────────────────────────────────────────
-if [[ -d "$TEXTFILE_DIR" ]]; then
+if (( ! CHECK )) && [[ -d "$TEXTFILE_DIR" ]]; then
   tmp="$(mktemp "$TEXTFILE_DIR/.cn_nvr_gpu_hang.XXXXXX")"
   cat > "$tmp" <<METRICS
 # HELP cn_nvr_i915_gpu_hang_boot_total Kernel "GPU HANG" lines since boot (resets on reboot).

@@ -20,5 +20,5 @@ install -m 0755 "$HERE/scripts/gpu-hang-reboot.sh" /usr/local/lib/cn-nvr/gpu-han
 install -m 0644 "$HERE/host/$UNIT.service" "$HERE/host/$UNIT.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now "$UNIT.timer" >/dev/null
-echo "timer: $(systemctl is-active "$UNIT.timer") — next run $(systemctl show "$UNIT.timer" -p NextElapseUSecRealtime --value)"
+echo "timer: $(systemctl is-active "$UNIT.timer")"; systemctl list-timers --no-pager "$UNIT.timer" | sed -n 2p
 /usr/local/lib/cn-nvr/gpu-hang-reboot.sh --check

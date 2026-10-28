@@ -49,6 +49,7 @@ git config user.name "Gonzalo Alvarez" && git config user.email gonzaloab@gmail.
 kauket request cerberus        # first time only (device flow); then `kauket approve` on the Mac
 kauket get cerberus.cn_nvr_env # installs .env (0600)
 sudo ./scripts/host-firewall.sh
+sudo ./scripts/host-gpu-hang-reboot.sh   # conditional GPU-hang reboot timer (see below)
 ./setup.sh
 amun docker                    # installs docker-compose@cn-nvr boot unit + reconcile cron
 ```
@@ -133,6 +134,7 @@ Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S
 
 - **Detector crash-loop / Frigate restarting / HA shows 500-502 from :5000** — `docker logs cn-nvr-frigate-1 | grep -A3 'Process frigate.detector'`; a `could not broadcast input array` ValueError means the `model.input_tensor` layout is wrong for the model (the bundled OpenVINO SSDLite is `nhwc`). Frigate's watchdog restarts the detector forever and the API flaps.
 - **Detector slow / CPU pegged** — `docker compose logs frigate | grep -i openvino`; if the GPU plugin failed, set `detectors.ov.device: CPU` in the template, `./setup.sh --render`, recreate frigate. `FrigateDetectorSlow` (>100 ms) is the alert.
+- **Detector dead, Frigate still "healthy"** (no events, recordings timeline full of gaps, garage never opens) — the iGPU is hung: `sudo journalctl -k -b | grep -c 'GPU HANG'` > 0, `/api/stats` shows `skipped_fps ≈ camera_fps`, `detection_fps 0`, inference frozen, and `frigate.detector:ov` sits in `i915_request_wait_timeout`. Only a host reboot clears it; see [GPU hang: conditional reboot](#gpu-hang-conditional-reboot).
 - **Camera 0 fps** — RTSP/credentials: `docker exec cn-nvr-frigate-1 ffprobe rtsp://127.0.0.1:8554/driveway`; the go2rtc page is `http://127.0.0.1:15000` → *System* → go2rtc.
 - **`TRAEFIK DEFAULT CERT`** — HTTP-01 failed: the name must exist in Technitium and as a pfSense Host Override, UFW must allow 80 from pki, `pki.lan` is pinned in `extra_hosts`.
 - **LAN login loops / 404 from Authentik** — neptune's Traefik must trust forwarded headers from `10.0.0.0/24` (cn-authentik `forwardedHeaders.trustedIPs`).
@@ -140,3 +142,19 @@ Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S
 - **HA integration cannot connect** — from homeiot `nc -vz 10.0.0.230 5000 1883 8554`; UFW rule present (`scripts/host-firewall.sh`), traefik-lan running, HA's IP still `10.1.1.134`.
 - **Recordings volume filling** — `frigate_storage_*` in Grafana; lower `record.continuous.days` or the Axis bitrate; Frigate deletes the oldest segments itself when space runs out.
 - **shm** — three or more cameras, or detect above 720p: recompute `shm_size` ((w×h×1.5×20+270480)/1048576 MB per camera + 40).
+
+## GPU hang: conditional reboot
+
+The HD 530 (Skylake) iGPU hangs under OpenVINO every few days (`i915 … GPU HANG: ecode 9:0:00000000`, `Resetting rcs0 for stopped heartbeat` every 3 s; upstream: Frigate issue #8338). Frigate's detector then blocks in `i915_request_wait_timeout` for good — no detection, no plate reads, the recording maintainer discards segments — while the API keeps answering, so the container stays healthy and Frigate's own watchdog cannot help (a respawned detector hangs again while loading the model). Neither a container recreate nor the Frigate version fixes it; a host reboot does. Hit 2026-10-18 and 2026-10-27.
+
+`scripts/host-gpu-hang-reboot.sh` installs `cn-nvr-gpu-hang-reboot.timer` (every 5 min, units from `host/`) running `scripts/gpu-hang-reboot.sh` as root. Every timer run publishes `cn_nvr_i915_gpu_hang_boot_total`, `cn_nvr_i915_gpu_hang_recent`, `cn_nvr_gpu_hang_reboot_pending`, `cn_nvr_gpu_hang_reboot_last_timestamp_seconds` and `cn_nvr_gpu_hang_check_timestamp_seconds` through the node-exporter textfile collector (`/var/lib/node_exporter/textfile_collector/cn_nvr_gpu_hang.prom`), so Grafana and the VPS alert rules can see a hang the moment it happens. The host reboots only when **all** hold: a `GPU HANG` was logged in the last 15 minutes of this boot (hung now, not a cleared blip); the local hour is in **04:00–05:59 America/New_York**; uptime ≥ 30 min; no reboot by this script yet today (one shot per night, never a boot loop). Outside the window the hang is reported as *pending* and the host keeps running blind until 04:00. Each decision is logged (`journalctl -u cn-nvr-gpu-hang-reboot.service`).
+
+```sh
+sudo /usr/local/lib/cn-nvr/gpu-hang-reboot.sh --check                                   # decision now; never reboots, never writes metrics
+sudo env WINDOW_START=0 WINDOW_END=24 /usr/local/lib/cn-nvr/gpu-hang-reboot.sh --check  # prove the in-window branch
+systemctl list-timers cn-nvr-gpu-hang-reboot.timer; journalctl -u cn-nvr-gpu-hang-reboot.service -b
+sudo ./scripts/host-gpu-hang-reboot.sh --remove                                          # disable + delete
+```
+
+A reboot costs about 2.5 minutes of recordings and detection (measured 2026-10-24: 47 s to stop the stack, Frigate healthy at +2:07, HA cameras back at +2:37); the window avoids the Sunday 03:00 offen backup and 03:10 e2scrub. The durable alternative that removes the hang entirely is `detectors.ov.device: CPU` (template → `./setup.sh --render` → recreate frigate) or a Coral.
+

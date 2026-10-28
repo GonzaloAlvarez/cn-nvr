@@ -129,6 +129,7 @@ done
 curl -sf http://127.0.0.1:15000/api/version >/dev/null && echo "  frigate: $(curl -sf http://127.0.0.1:15000/api/version)" || echo "  frigate: not answering yet (docker compose logs frigate)"
 curl -sf http://127.0.0.1:13000/api/health >/dev/null && echo "  grafana: ok" || echo "  grafana: not answering yet (docker compose logs grafana)"
 sudo ufw status 2>/dev/null | grep -q '443' || echo "  WARNING: UFW has no 443 rule — run: sudo ./scripts/host-firewall.sh"
+systemctl is-enabled cn-nvr-gpu-hang-reboot.timer >/dev/null 2>&1 || echo "  WARNING: GPU-hang conditional reboot timer not installed — run: sudo ./scripts/host-gpu-hang-reboot.sh"
 
 cat <<SUMMARY
 
