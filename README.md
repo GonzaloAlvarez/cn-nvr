@@ -1,14 +1,14 @@
 # cn-nvr — Frigate NVR on cerberus.lan
 
-Frigate 0.18 (recording, live view, object detection, license-plate recognition) with Mosquitto, a host-local Prometheus/Grafana, the host's Traefik and Watchtower, and the Home Assistant contract that lets a recognised plate open the garage. Dedicated-host stack in the homelab model (see `homelab/architecture.md`: "Dedicated hosts").
+Frigate 0.18 (recording, live view, object detection, license-plate recognition) with Mosquitto, the host's Traefik and Watchtower, and the Home Assistant contract that lets a recognised plate open the garage. Dashboards live on kaiser's Grafana (cn-observability), fed through a kaiser-only metrics entrypoint on this host's Traefik. Dedicated-host stack in the homelab model (see `homelab/architecture.md`: "Dedicated hosts").
 
 | Surface | URL | Who |
 |---|---|---|
 | Frigate, LAN | `https://nvr.cerberus.lan` (step-ca) | Authentik forward-auth: `cameras` → viewer, `infra-admins` → admin |
 | Frigate, tailnet | `https://nvr.lab.gn.al` (LE) | same groups via `outpost-lab`; this is the name to install the PWA from on phones |
-| Grafana (host-local) | `https://grafana.cerberus.lan` (step-ca) | Authentik OIDC, `observability` group (shared `grafana` provider) |
 | HA contract (homeiot only) | `10.0.0.230:5000` Frigate API · `:1883` MQTT · `:8554` RTSP restream | Traefik `ClientIP`/`ipAllowList` + UFW, source `10.1.1.134` |
-| Break-glass | `http://127.0.0.1:15000` on the host (Frigate internal API, admin, no auth) · Grafana local admin (`GF_ADMIN_PASSWORD`) | operator on the host |
+| Metrics for kaiser (kaiser only) | `http://10.0.0.230:9100/metrics` (node-exporter) · `/api/metrics` (Frigate) | Traefik `ClientIP` + UFW, source `10.1.1.140` (cn-observability Prometheus; dashboards on `grafana.kaiser.lan`) |
+| Break-glass | `http://127.0.0.1:15000` on the host (Frigate internal API, admin, no auth) | operator on the host |
 
 ## Health checks
 
@@ -20,27 +20,29 @@ docker exec cn-nvr-ts-nvr-1 tailscale status | head -3   # node `nvr` online
 docker compose -p cn-nvr logs --tail=50 frigate | grep -iE "openvino|vaapi|error" # detector on GPU, no decode errors
 curl -skI https://nvr.cerberus.lan/api/version | head -1 # 200 through traefik-lan (ungated probe)
 curl -skI https://nvr.cerberus.lan/ | grep -i location   # 302 to auth.neptune.lan (gate works)
-curl -sf http://127.0.0.1:13000/api/health               # Grafana
+curl -s -o /dev/null -w '%{http_code}\n' http://10.0.0.230:9100/metrics   # 404 from the host = kaiser-metrics entrypoint listening (ClientIP gate)
+ssh kaiser.lan curl -s http://10.0.0.230:9100/metrics | head -1          # 200 + node_* lines from kaiser only
 ```
 
-Dashboards: `grafana.cerberus.lan` → *cerberus.lan overview*, *Frigate NVR*; the VPS Grafana (`grafana.lab.gn.al`) has the same *Frigate NVR* dashboard plus logs, and owns the alerts (`FrigateDown`, `FrigateCameraStalled`, `FrigateDetectorSlow`, `FrigateStorageLow`, `NvrNodeDown`).
+Dashboards: `grafana.kaiser.lan` (cn-observability) → *cerberus.lan overview*, *Frigate NVR*, scraped through the kaiser-only metrics entrypoint (kaiser jobs `cerberus-node`, `frigate`; `CerberusLanScrapeDown` warns after 15 min if that path breaks); the VPS Grafana (`grafana.lab.gn.al`) has the same *Frigate NVR* dashboard plus logs, and owns the alerts (`FrigateDown`, `FrigateCameraStalled`, `FrigateDetectorSlow`, `FrigateStorageLow`, `NvrNodeDown`). Both JSONs are generated here, see [Dashboards](#dashboards).
 
 ## Layout
 
 ```
 ts-nvr (tag:svc, node nvr, bridge 172.30.5.10)   netns shared by: frigate, mosquitto, node-exporter, promtail, consul-register
   publishes 127.0.0.1 only: 18971→8971 (UI/API), 15000→5000 (internal API), 11883→1883 (MQTT), 18554→8554 (RTSP)
-traefik-lan (host network, step-ca)              nvr.cerberus.lan (+authentik-lan), /api/version ungated, grafana.cerberus.lan,
-                                                 10.0.0.230:5000/1883/8554 for Home Assistant only
-bridge                                            prometheus (scrapes 172.30.5.10:5000 /api/metrics and :9100), grafana, backup (offen), watchdog, mount-precheck
+traefik-lan (host network, step-ca)              nvr.cerberus.lan (+authentik-lan), /api/version ungated,
+                                                 10.0.0.230:5000/1883/8554 for Home Assistant only,
+                                                 10.0.0.230:9100 /metrics + /api/metrics for kaiser only (→ 172.30.5.10:9100, 127.0.0.1:15000)
+bridge                                            backup (offen), watchdog, mount-precheck
 host                                              /srv/frigate/media (1.8 TB LVM) = recordings/clips/exports; ./config = config.yml + frigate.db + model_cache (SSD)
 ```
 
-Trust model: ports 8971/5000/1883/8554/9100 are open on the sidecar's tailnet interface to `tag:infra` (traefik-lab, Prometheus) and the operator identity only; the Headscale ACL already confines `tag:svc:*` that way, and family/untagged users never reach them. On the LAN the only listeners are Traefik's. Frigate trusts the `X-authentik-*` headers from Traefik (no `proxy.auth_secret`); Traefik strips and re-sets those headers on every request. Phase-2 hardening, if ever wanted: an iptables rule in the `ts-nvr` entrypoint restricting `tailscale0` ingress to `100.64.0.1` (cn-bittorrent kill-switch precedent).
+Trust model: ports 8971/5000/1883/8554/9100 are open on the sidecar's tailnet interface to `tag:infra` (traefik-lab, Prometheus) and the operator identity only; the Headscale ACL already confines `tag:svc:*` that way, and family/untagged users never reach them. On the LAN the only listeners are Traefik's; the metrics entrypoint on 9100 is plain HTTP, accepted only from kaiser (`ClientIP` and UFW), and routes nothing but the two metrics paths. Frigate trusts the `X-authentik-*` headers from Traefik (no `proxy.auth_secret`); Traefik strips and re-sets those headers on every request. Phase-2 hardening, if ever wanted: an iptables rule in the `ts-nvr` entrypoint restricting `tailscale0` ingress to `100.64.0.1` (cn-bittorrent kill-switch precedent).
 
 ## First install
 
-Prerequisites done elsewhere: pfSense static mapping `10.0.0.230` + Host Overrides (`cn-home` `LAN_HOSTS`/`LAN_STATIC_MAPPINGS`), Technitium records (`cn-dnsdhcpd/dns/records.tsv`), Authentik providers (`cn-authentik/setup-nvr-proxy-sso.sh`, `setup-grafana-oidc.sh`), neptune's Traefik trusting `10.0.0.0/24`, Headscale `tag:svc` key, Kauket secret `cerberus.cn_nvr_env`.
+Prerequisites done elsewhere: pfSense static mapping `10.0.0.230` + Host Overrides (`cn-home` `LAN_HOSTS`/`LAN_STATIC_MAPPINGS`), Technitium records (`cn-dnsdhcpd/dns/records.tsv`), Authentik provider (`cn-authentik/setup-nvr-proxy-sso.sh`), neptune's Traefik trusting `10.0.0.0/24`, Headscale `tag:svc` key, Kauket secret `cerberus.cn_nvr_env`.
 
 ```sh
 # on cerberus
@@ -61,7 +63,7 @@ amun docker                    # installs docker-compose@cn-nvr boot unit + reco
 ```sh
 cd ~/cn-nvr && git pull && docker compose up -d --force-recreate --no-deps <service>
 ```
-Single-file binds (`traefik-lan/dynamic.yml`, `promtail/promtail.yml`, `mosquitto/*`, `prometheus/prometheus.yml`) keep the old inode after a pull — recreate, never reload. Re-run `./setup.sh` when a template changed. Whole stack: `sudo systemctl restart docker-compose@cn-nvr`.
+Single-file binds (`traefik-lan/dynamic.yml`, `promtail/promtail.yml`, `mosquitto/*`) keep the old inode after a pull — recreate, never reload. Re-run `./setup.sh` when a template changed. Whole stack: `sudo systemctl restart docker-compose@cn-nvr`.
 
 ## Frigate configuration: template → rendered → pull back
 
@@ -108,13 +110,25 @@ Tests that do not move the door — publish a synthetic event through HA itself 
 
 The push and `input_text.nvr_last_plate_event` must read `not opening: HA already opened the door` and `script.nvr_garage_safe_open` must not have run; switch the latch off afterwards. Departure path: with the latch still on, publish the same synthetic read twice, first with `"camera":"ptz"` then with `"camera":"driveway"` (the Frigate integration flips the last-camera sensor PTZ → Driveway); `input_text.nvr_last_departure_event` must read `no-close: door is closed` (or `HA arrival cycle in progress` when the door is open) and the door must not move. To exercise the opener itself, run the script from Developer tools with the door closed and watch `lock.ratgdo32_9a2c58_lock_remotes` go `locked` → door `open` → `unlocked`. Later second factors: a zone-occupancy condition (`binary_sensor.<camera>_<zone>_car_occupancy`, once the `driveway_approach` zone exists) and a Frigate custom vehicle-identity classifier (train on the car, not the plate).
 
+## Dashboards
+
+`grafana/build-dashboards.py` generates both dashboards (uids `cerberus-overview`, `frigate`) into `grafana/dist/`; nothing on cerberus consumes them (the host-local Prometheus/Grafana was retired on 2026-10-30). After a change, copy and recreate the consuming Grafana:
+
+| Output | Destination |
+|---|---|
+| `dist/cerberus-overview.json` | `cn-observability/config/grafana/provisioning/dashboards/cerberus-overview.json` (kaiser) |
+| `dist/frigate-lan.json` | `cn-observability/config/grafana/provisioning/dashboards/frigate.json` (kaiser; no Loki rows — cerberus logs go to the VPS) |
+| `dist/frigate.json` | `cn-root-docker/tailnet/grafana/provisioning/dashboards/frigate.json` (VPS; adds the Loki rows) |
+
+kaiser scrapes `10.0.0.230:9100` as jobs `cerberus-node` (`/metrics`) and `frigate` (`/api/metrics`), both labelled `host=cerberus`, `stack=cn-nvr`; the Frigate dashboard's `$host` variable picks `cerberus` there and `nvr` on the VPS. The job name `frigate` is shared because the dashboard hardcodes `up{job="frigate"}`.
+
 ## State, backup, restore
 
 | State | Where | Backup |
 |---|---|---|
 | `config/config.yml`, `frigate.db` (events, review items, plates), `model_cache` | `./config` (SSD) | weekly offen → S3 `cloudnet-lab-storage/nvr/` + raidnas WebDAV `/nvr/`; `frigate` runs an `archive-pre` SQLite online-backup to `frigate.db.snapshot`, the live WAL db and `model_cache` are excluded |
 | recordings, clips, exports | `/srv/frigate/media` (1.8 TB LVM, retention-bound: continuous 7 d, motion 14 d, alerts 30 d, detections 14 d) | **none, deliberately** |
-| Mosquitto persistence, Traefik ACME, Prometheus TSDB, Grafana | named volumes | none — rebuilt from provisioning / re-issued |
+| Mosquitto persistence, Traefik ACME | named volumes | none — re-issued / rebuilt |
 
 Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S3 and `http://raidnas.lan:5005/cloudlabbackup/nvr/`. Restore: `kauket get cerberus.cn_nvr_env`, clone, unpack the archive's `config/` into `./config` (rename `frigate.db.snapshot` → `frigate.db`), `./setup.sh`.
 
@@ -123,7 +137,6 @@ Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S
 | Image | Pin | Why / unpin condition |
 |---|---|---|
 | `ghcr.io/blakeblackshear/frigate:0.18.0` | explicit, Watchtower-excluded | Frigate migrates its DB on boot and 0.x minors rename config keys. Upgrade by hand: release notes → back up `./config` → bump → `up -d frigate` → re-check `config.yml.tmpl`. Never auto-updated by design. |
-| `grafana/grafana:11.2.0`, `prom/prometheus:v2.55.0` | same as kaiser's cn-observability, Watchtower-excluded | dashboard JSON is schemaVersion 39; bump together with cn-observability |
 | `traefik:v3.6.9`, `eclipse-mosquitto:2`, `tailscale/tailscale:latest`, exporters | Watchtower (host-wide, 04:00) | — |
 
 ## Resiliency
@@ -138,9 +151,9 @@ Manual run: `docker exec cn-nvr-backup-1 /usr/bin/backup`; check the object in S
 - **Camera 0 fps** — RTSP/credentials: `docker exec cn-nvr-frigate-1 ffprobe rtsp://127.0.0.1:8554/driveway`; the go2rtc page is `http://127.0.0.1:15000` → *System* → go2rtc.
 - **`TRAEFIK DEFAULT CERT`** — HTTP-01 failed: the name must exist in Technitium and as a pfSense Host Override, UFW must allow 80 from pki, `pki.lan` is pinned in `extra_hosts`.
 - **LAN login loops / 404 from Authentik** — neptune's Traefik must trust forwarded headers from `10.0.0.0/24` (cn-authentik `forwardedHeaders.trustedIPs`).
-- **Grafana "Client ID Error"** — `AUTHENTIK_GRAFANA_CLIENT_*` drifted from the provider record on neptune; compare against the record, not another host's `.env`.
+- **kaiser shows `cerberus-node`/`frigate` DOWN (`CerberusLanScrapeDown`)** — from kaiser `curl -s http://10.0.0.230:9100/metrics | head -1`; check the UFW rule for 9100 from 10.1.1.140 (`sudo ./scripts/host-firewall.sh`), traefik-lan running with the `kaiser-metrics` entrypoint (`ss -tlnp | grep 9100`), and ts-nvr still at `172.30.5.10` (`docker inspect cn-nvr-ts-nvr-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`). From the host itself the endpoint answers 404 by design (ClientIP).
 - **HA integration cannot connect** — from homeiot `nc -vz 10.0.0.230 5000 1883 8554`; UFW rule present (`scripts/host-firewall.sh`), traefik-lan running, HA's IP still `10.1.1.134`.
-- **Recordings volume filling** — `frigate_storage_*` in Grafana; lower `record.continuous.days` or the Axis bitrate; Frigate deletes the oldest segments itself when space runs out.
+- **Recordings volume filling** — `frigate_storage_*` in the *Frigate NVR* dashboard on kaiser; lower `record.continuous.days` or the Axis bitrate; Frigate deletes the oldest segments itself when space runs out.
 - **shm** — three or more cameras, or detect above 720p: recompute `shm_size` ((w×h×1.5×20+270480)/1048576 MB per camera + 40).
 
 ## GPU hang: conditional reboot

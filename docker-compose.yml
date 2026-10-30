@@ -6,17 +6,17 @@
 #     each other on localhost and the VPS reaches them at nvr.ts.gn.al.
 #   * ts-nvr publishes ONLY on 127.0.0.1 (odd host ports so the host-network
 #     traefik-lan can own the real ports). Everything LAN-facing goes through
-#     traefik-lan: nvr.cerberus.lan + grafana.cerberus.lan on 443 (step-ca),
-#     and three HA-only entrypoints bound to ${CERBERUS_IP} for the Frigate
-#     API (5000), MQTT (1883) and the go2rtc RTSP restream (8554), each
-#     restricted to ${HA_IP} by Traefik (ClientIP / ipAllowList) AND by UFW
-#     (scripts/host-firewall.sh). Docker-published ports bypass UFW, which is
+#     traefik-lan: nvr.cerberus.lan on 443 (step-ca); three HA-only
+#     entrypoints bound to ${CERBERUS_IP} for the Frigate API (5000), MQTT
+#     (1883) and the go2rtc RTSP restream (8554), each restricted to ${HA_IP}
+#     by Traefik (ClientIP / ipAllowList) AND by UFW (scripts/host-firewall.sh);
+#     and a kaiser-only metrics entrypoint on ${CERBERUS_IP}:9100 (plain HTTP)
+#     through which kaiser's cn-observability scrapes node-exporter and
+#     Frigate. The dashboards for this host live on grafana.kaiser.lan since
+#     2026-10-30 — there is no host-local Prometheus/Grafana any more; the VPS
+#     plane owns alerts and logs. Docker-published ports bypass UFW, which is
 #     why nothing here publishes on the LAN address directly.
-#   * prometheus + grafana (host-local observability plane, grafana.cerberus.lan)
-#     live on the project bridge: Grafana must resolve auth.neptune.lan through
-#     host DNS, which the MagicDNS-owned netns cannot do. Prometheus scrapes the
-#     netns through ts-nvr's pinned bridge address (172.30.5.10).
-#   * backup (offen) is on the bridge too (raidnas.lan must resolve).
+#   * backup (offen) is on the bridge (raidnas.lan must resolve).
 #   * mount-precheck gates the stack on the real /srv LVM volume. amun-docker's
 #     resiliency.yml can only gate NFS mounts, so this is the only /srv gate;
 #     inside a container a bind mount is always a mountpoint, hence the
@@ -65,9 +65,10 @@ services:
       - SSL_CERT_DIR=/staging-certs
     networks:
       default:
-        # Pinned: the local Prometheus scrapes frigate (:5000) and
-        # node-exporter (:9100) through this address. Dynamic allocation is
-        # confined to 172.30.5.128/25 (see networks:) so the pin cannot collide.
+        # Pinned: traefik-lan (host network) proxies kaiser's node-exporter
+        # scrape to this address (dynamic.yml service `node-exporter` →
+        # 172.30.5.10:9100). Dynamic allocation is confined to 172.30.5.128/25
+        # (see networks:) so the pin cannot collide.
         ipv4_address: 172.30.5.10
     ports:
       # Loopback only. Host port != container port on purpose: traefik-lan
@@ -243,8 +244,9 @@ services:
     restart: unless-stopped
 
   # ── node-exporter: host metrics for both planes (VPS via nvr.ts.gn.al:9100,
-  # local Prometheus via 172.30.5.10:9100). Also exposes amun-docker's
-  # resilience_* textfile metrics — this is the only exporter on cerberus.
+  # kaiser via traefik-lan's kaiser-metrics entrypoint → 172.30.5.10:9100).
+  # Also exposes amun-docker's resilience_* and the GPU-hang textfile metrics
+  # — this is the only exporter on cerberus.
   node-exporter:
     image: prom/node-exporter:latest
     network_mode: "service:ts-nvr"
@@ -265,68 +267,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Host-local observability plane: Prometheus + Grafana (grafana.cerberus.lan).
-  # No alerting here — the VPS plane (cn-root-docker) owns alerts for cn-nvr.
-  # Same Prometheus pin as kaiser's cn-observability; bump them together.
-  prometheus:
-    image: prom/prometheus:v2.55.0
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=30d"
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    labels:
-      com.centurylinklabs.watchtower.enable: "false"
-    depends_on:
-      ts-nvr:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # Grafana: same image + Authentik generic-OAuth block as kaiser's
-  # cn-observability (one shared Authentik provider `grafana`, this is its
-  # third redirect URI; the client pair in .env must match the provider
-  # record — a drifted pair shows up as "Client ID Error" on login).
-  # PINNED like kaiser (dashboard JSON is schemaVersion 39); unpin/bump
-  # together with cn-observability. On the bridge so auth.neptune.lan
-  # resolves via host DNS; trusts step-ca for the OIDC backchannel.
-  grafana:
-    image: grafana/grafana:11.2.0
-    ports:
-      - "127.0.0.1:13000:3000"
-    environment:
-      - GF_SERVER_ROOT_URL=https://${GRAFANA_LAN_HOST}
-      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
-      - GF_AUTH_ANONYMOUS_ENABLED=false
-      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
-      - GF_AUTH_GENERIC_OAUTH_NAME=Authentik
-      - GF_AUTH_GENERIC_OAUTH_CLIENT_ID=${AUTHENTIK_GRAFANA_CLIENT_ID}
-      - GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET=${AUTHENTIK_GRAFANA_CLIENT_SECRET}
-      - GF_AUTH_GENERIC_OAUTH_SCOPES=openid profile email groups
-      - GF_AUTH_GENERIC_OAUTH_USE_PKCE=true
-      - GF_AUTH_GENERIC_OAUTH_AUTH_URL=https://auth.neptune.lan/application/o/authorize/
-      - GF_AUTH_GENERIC_OAUTH_TOKEN_URL=https://auth.neptune.lan/application/o/token/
-      - GF_AUTH_GENERIC_OAUTH_API_URL=https://auth.neptune.lan/application/o/userinfo/
-      - GF_AUTH_GENERIC_OAUTH_SIGNOUT_REDIRECT_URL=https://auth.neptune.lan/application/o/grafana/end-session/
-      - GF_AUTH_GENERIC_OAUTH_ALLOWED_GROUPS=observability
-      - GF_AUTH_GENERIC_OAUTH_GROUPS_ATTRIBUTE_PATH=groups
-      - GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH=contains(groups[*], 'observability') && 'Admin' || 'Viewer'
-      - GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT=false
-      - GF_AUTH_GENERIC_OAUTH_TLS_CLIENT_CA=/etc/grafana/step-ca.crt
-      - GF_AUTH_OAUTH_ALLOW_INSECURE_EMAIL_LOOKUP=true
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./certs/root_ca.crt:/etc/grafana/step-ca.crt:ro
-      - grafana_data:/var/lib/grafana
-    labels:
-      com.centurylinklabs.watchtower.enable: "false"
-    depends_on:
-      - prometheus
-    restart: unless-stopped
-
-  # ── LAN edge for this host (network_mode: host; owns 80/443 and the HA-only
-  # entrypoints). step-ca ACME HTTP-01: pki validates through pfSense Unbound,
+  # ── LAN edge for this host (network_mode: host; owns 80/443, the HA-only
+  # entrypoints and the kaiser-only metrics entrypoint). step-ca ACME HTTP-01: pki validates through pfSense Unbound,
   # so every name here needs a pfSense Host Override (cn-home LAN_HOSTS) as
   # well as the Technitium record, and UFW must allow 80 from pki.
   traefik-lan:
@@ -340,6 +282,10 @@ services:
       - "--entrypoints.frigate-api.address=${CERBERUS_IP}:5000"
       - "--entrypoints.mqtt.address=${CERBERUS_IP}:1883"
       - "--entrypoints.rtsp.address=${CERBERUS_IP}:8554"
+      # kaiser-only metrics plane (plain HTTP): kaiser's cn-observability
+      # scrapes /metrics (node-exporter) and /api/metrics (Frigate) here.
+      # Routers in dynamic.yml restrict it to KAISER_IP; UFW does the same.
+      - "--entrypoints.kaiser-metrics.address=${CERBERUS_IP}:9100"
       - "--providers.file.filename=/etc/traefik/dynamic.yml"
       - "--providers.file.watch=true"
       - "--certificatesresolvers.stepca.acme.caserver=https://${PKI_IP}:9000/acme/acme/directory"
@@ -364,8 +310,7 @@ services:
   # snapshot taken by frigate's archive-pre hook; model_cache and the live
   # WAL db excluded) to S3 cloudnet-lab-storage/nvr/ + raidnas WebDAV /nvr/.
   # Recordings (/srv/frigate/media) are deliberately NOT backed up: they are
-  # retention-bound and up to ~1.5 TB. prometheus_data/grafana_data are
-  # rebuilt from provisioning. On the bridge: raidnas.lan must resolve.
+  # retention-bound and up to ~1.5 TB. On the bridge: raidnas.lan must resolve.
   backup:
     image: offen/docker-volume-backup:v2.43.4
     environment:
@@ -481,6 +426,4 @@ volumes:
   ts_state:
   mosquitto_data:
   traefik_lan_acme:
-  prometheus_data:
-  grafana_data:
   promtail_positions:

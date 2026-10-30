@@ -1,5 +1,5 @@
 # cn-nvr traefik-lan dynamic config — rendered by setup.sh with envsubst
-# (${NVR_LAN_HOST}, ${GRAFANA_LAN_HOST}, ${HA_IP}). Single-file bind mount:
+# (${NVR_LAN_HOST}, ${KAISER_IP}, ${HA_IP}). Single-file bind mount:
 # after a git pull run `docker compose up -d --force-recreate --no-deps traefik-lan`.
 http:
   middlewares:
@@ -55,15 +55,20 @@ http:
       tls:
         certResolver: stepca
 
-    # Host-local Grafana. No forward-auth middleware: Grafana runs its own
-    # Authentik OIDC login (shared provider `grafana`, allowed group
-    # `observability`), like grafana.kaiser.lan.
-    grafana-lan:
-      rule: "Host(`${GRAFANA_LAN_HOST}`)"
-      entryPoints: [websecure]
-      service: grafana
-      tls:
-        certResolver: stepca
+    # kaiser-only metrics plane (entrypoint kaiser-metrics = CERBERUS_IP:9100,
+    # plain HTTP). kaiser's cn-observability Prometheus scrapes node-exporter
+    # (/metrics, through ts-nvr's pinned bridge address) and Frigate's native
+    # endpoint (/api/metrics on the internal, unauthenticated port). Only
+    # KAISER_IP is accepted (UFW enforces the same source); any other client
+    # or path gets 404. The dashboards live on grafana.kaiser.lan.
+    node-metrics-kaiser:
+      rule: "ClientIP(`${KAISER_IP}/32`) && Path(`/metrics`)"
+      entryPoints: [kaiser-metrics]
+      service: node-exporter
+    frigate-metrics-kaiser:
+      rule: "ClientIP(`${KAISER_IP}/32`) && Path(`/api/metrics`)"
+      entryPoints: [kaiser-metrics]
+      service: frigate-internal
 
     # Home Assistant's Frigate integration talks to the INTERNAL,
     # unauthenticated port (anonymous = admin). Plain HTTP on ${CERBERUS_IP}:5000,
@@ -82,10 +87,10 @@ http:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:15000"
-    grafana:
+    node-exporter:
       loadBalancer:
         servers:
-          - url: "http://127.0.0.1:13000"
+          - url: "http://172.30.5.10:9100"
 
 tcp:
   middlewares:

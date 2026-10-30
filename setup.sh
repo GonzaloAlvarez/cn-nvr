@@ -33,11 +33,14 @@ die() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 env_get() { grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- || true; }
 
 [[ -f .env ]] || die ".env not found. Run: kauket get cerberus.cn_nvr_env"
-for k in CERBERUS_IP HA_IP NVR_LAN_HOST GRAFANA_LAN_HOST INFRA_VPS_TAILNET_IP NVR_AUTHKEY ADMIN_EMAIL \
-         FRIGATE_MQTT_PASSWORD HA_MQTT_PASSWORD NVR_PLATE_GONZALO GF_ADMIN_PASSWORD; do
+for k in CERBERUS_IP HA_IP NVR_LAN_HOST INFRA_VPS_TAILNET_IP NVR_AUTHKEY ADMIN_EMAIL \
+         FRIGATE_MQTT_PASSWORD HA_MQTT_PASSWORD NVR_PLATE_GONZALO; do
   [[ -n "$(env_get "$k")" ]] || die "$k is empty in .env"
 done
 CERBERUS_IP="$(env_get CERBERUS_IP)"
+# kaiser (cn-observability) is the only client of the metrics entrypoint;
+# default so an older Kauket .env without KAISER_IP keeps working.
+KAISER_IP="$(env_get KAISER_IP)"; KAISER_IP="${KAISER_IP:-10.1.1.140}"
 ip -4 -o addr show | grep -q " ${CERBERUS_IP}/" \
   || die "this host does not own ${CERBERUS_IP} (pfSense static mapping + lease renewal first)"
 
@@ -51,8 +54,8 @@ fi
 
 # ── render templates ────────────────────────────────────────────────────────
 log "rendering traefik-lan/dynamic.yml and promtail/promtail.yml"
-NVR_LAN_HOST="$(env_get NVR_LAN_HOST)" GRAFANA_LAN_HOST="$(env_get GRAFANA_LAN_HOST)" HA_IP="$(env_get HA_IP)" \
-  envsubst '${NVR_LAN_HOST} ${GRAFANA_LAN_HOST} ${HA_IP}' < traefik-lan/dynamic.yml.tmpl > traefik-lan/dynamic.yml
+NVR_LAN_HOST="$(env_get NVR_LAN_HOST)" KAISER_IP="$KAISER_IP" HA_IP="$(env_get HA_IP)" \
+  envsubst '${NVR_LAN_HOST} ${KAISER_IP} ${HA_IP}' < traefik-lan/dynamic.yml.tmpl > traefik-lan/dynamic.yml
 INFRA_VPS_TAILNET_IP="$(env_get INFRA_VPS_TAILNET_IP)" \
   envsubst '${INFRA_VPS_TAILNET_IP}' < promtail/promtail.yml.tmpl > promtail/promtail.yml
 
@@ -122,21 +125,26 @@ if [[ -n "$PASSWD_BEFORE" && "$PASSWD_BEFORE" != "$PASSWD_AFTER" ]]; then
   docker compose up -d --force-recreate --no-deps mosquitto
 fi
 
-log "waiting for Frigate (http://127.0.0.1:15000/api/version) and Grafana (http://127.0.0.1:13000/api/health)"
+log "waiting for Frigate (http://127.0.0.1:15000/api/version)"
 for _ in $(seq 1 36); do
   if curl -sf http://127.0.0.1:15000/api/version >/dev/null 2>&1; then break; fi; sleep 5
 done
 curl -sf http://127.0.0.1:15000/api/version >/dev/null && echo "  frigate: $(curl -sf http://127.0.0.1:15000/api/version)" || echo "  frigate: not answering yet (docker compose logs frigate)"
-curl -sf http://127.0.0.1:13000/api/health >/dev/null && echo "  grafana: ok" || echo "  grafana: not answering yet (docker compose logs grafana)"
+# The kaiser-only metrics entrypoint answers 404 to any non-kaiser source
+# (ClientIP router rule) — a 404 from the host itself proves it is listening.
+metrics_code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${CERBERUS_IP}:9100/metrics" || true)"
+[[ "$metrics_code" == "404" ]] && echo "  kaiser-metrics entrypoint: listening on ${CERBERUS_IP}:9100 (404 for non-kaiser sources, as designed)" \
+  || echo "  WARNING: ${CERBERUS_IP}:9100 answered '${metrics_code}' instead of 404 — check traefik-lan (docker compose logs traefik-lan)"
 sudo ufw status 2>/dev/null | grep -q '443' || echo "  WARNING: UFW has no 443 rule — run: sudo ./scripts/host-firewall.sh"
+sudo ufw status 2>/dev/null | grep -q '9100' || echo "  WARNING: UFW has no 9100 rule for kaiser — run: sudo ./scripts/host-firewall.sh"
 systemctl is-enabled cn-nvr-gpu-hang-reboot.timer >/dev/null 2>&1 || echo "  WARNING: GPU-hang conditional reboot timer not installed — run: sudo ./scripts/host-gpu-hang-reboot.sh"
 
 cat <<SUMMARY
 
 cn-nvr is up.
   LAN:     https://$(env_get NVR_LAN_HOST)   (Authentik: cameras / infra-admins)
-           https://$(env_get GRAFANA_LAN_HOST) (Authentik: observability)
   Tailnet: https://nvr.$(env_get LAB_DOMAIN)
+  Metrics: http://${CERBERUS_IP}:9100/metrics + /api/metrics — kaiser (${KAISER_IP}) only; dashboards on https://grafana.kaiser.lan
   Break-glass (host only): http://127.0.0.1:15000  (Frigate internal API, admin)
 Next: amun docker (first time) · draw zones in the UI · scripts/config-pull.sh · HA wiring (README).
 SUMMARY

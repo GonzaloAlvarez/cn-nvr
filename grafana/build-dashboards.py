@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Generate the cn-nvr Grafana dashboards.
 
-Outputs (committed):
-  grafana/provisioning/dashboards/cerberus-overview.json  host overview for the
-      local Grafana (grafana.cerberus.lan), adapted from kaiser-overview.json
-  grafana/provisioning/dashboards/frigate.json            Frigate dashboard, local
-      variant (no Loki datasource on cerberus)
-  grafana/dist/frigate.json                               Frigate dashboard, VPS
-      variant (adds Loki panels) -> copy into
-      cn-root-docker/tailnet/grafana/provisioning/dashboards/frigate.json
+Nothing on cerberus consumes these (the host-local Grafana was retired on
+2026-10-30); the outputs under grafana/dist/ are copied into the two Grafanas:
 
+  grafana/dist/cerberus-overview.json  host overview (host="cerberus"), adapted
+      from kaiser-overview.json -> cn-observability/config/grafana/provisioning/
+      dashboards/cerberus-overview.json (kaiser scrapes 10.0.0.230:9100)
+  grafana/dist/frigate-lan.json        Frigate dashboard, kaiser variant (no
+      Loki panels: cerberus logs go to the VPS Loki) ->
+      cn-observability/config/grafana/provisioning/dashboards/frigate.json
+  grafana/dist/frigate.json            Frigate dashboard, VPS variant (adds the
+      Loki rows) -> cn-root-docker/tailnet/grafana/provisioning/dashboards/frigate.json
+
+The Frigate dashboard's $host variable selects `cerberus` on kaiser and `nvr`
+on the VPS; both planes name the Frigate scrape job `frigate` because the
+"Frigate up" stat hardcodes up{job="frigate"}.
 Re-run after editing; keep uids stable (cerberus-overview, frigate).
 """
 import copy, json, pathlib
@@ -205,6 +211,6 @@ def write(path, obj):
 
 
 if __name__ == "__main__":
-    write(ROOT / "provisioning/dashboards/cerberus-overview.json", cerberus_overview())
-    write(ROOT / "provisioning/dashboards/frigate.json", frigate_dashboard(with_loki=False))
+    write(ROOT / "dist/cerberus-overview.json", cerberus_overview())
+    write(ROOT / "dist/frigate-lan.json", frigate_dashboard(with_loki=False))
     write(ROOT / "dist/frigate.json", frigate_dashboard(with_loki=True))
